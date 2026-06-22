@@ -1,0 +1,163 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs for the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 1: CPU-only unit tests
+  # Runs on standard GitHub-hosted runners (no GPU required).
+  # GPU tests are marked with @pytest.mark.gpu and automatically skipped.
+  # ────────────────────────────────────────────────────────────────────────────
+  test-cpu:
+    name: Unit Tests (CPU-only)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install package + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          # Install CPU-only torch to avoid pulling in CUDA runtime
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e ".[dev]"
+
+      - name: Show installed versions
+        run: |
+          python -c "import torch; print('torch:', torch.__version__)"
+          python -c "import agentkv; print('agentkv:', agentkv.__version__)"
+
+      - name: Run CPU-only tests
+        env:
+          AGENTKV_GPU_AVAILABLE: "0"
+        run: |
+          pytest tests/ -v -m "not gpu and not integration" \
+            --timeout=120 \
+            --tb=short \
+            -p no:warnings
+
+      - name: Coverage report
+        if: matrix.python-version == '3.11'
+        run: |
+          pip install coverage[toml]
+          coverage run -m pytest tests/ -m "not gpu and not integration" -q
+          coverage report
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 2: GPU tests (self-hosted runner with CUDA)
+  # Only runs when the AGENTKV_GPU_AVAILABLE secret is set and a GPU runner
+  # is available.  Skipped on forks and in standard GitHub-hosted runners.
+  #
+  # To enable: add a self-hosted runner with a GPU and set the repository
+  # secret AGENTKV_HAS_GPU_RUNNER=true.
+  # ────────────────────────────────────────────────────────────────────────────
+  test-gpu:
+    name: GPU Tests (self-hosted, CUDA)
+    runs-on: [self-hosted, gpu]
+    # Skip this job unless the repo has a GPU runner configured
+    if: ${{ vars.AGENTKV_HAS_GPU_RUNNER == 'true' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install package + dev + GPU deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[gpu,dev]"
+
+      - name: nvidia-smi sanity check
+        run: nvidia-smi
+
+      - name: Run all tests (including GPU)
+        env:
+          AGENTKV_GPU_AVAILABLE: "1"
+        run: |
+          pytest tests/ -v --timeout=300 --tb=short
+
+      - name: Run compute-sanitizer on GPU allocator stress test
+        # compute-sanitizer is CUDA's race / memory error detector.
+        # We run it on the stress test to catch any races in the Triton kernels.
+        # If compute-sanitizer is not installed, this step is skipped gracefully.
+        run: |
+          if command -v compute-sanitizer &>/dev/null; then
+            echo "Running compute-sanitizer on stress test..."
+            compute-sanitizer --tool memcheck python -m pytest \
+              tests/test_stress.py -v --timeout=600
+          else
+            echo "compute-sanitizer not found — skipping race detection step."
+            echo "Install CUDA toolkit to enable this check."
+          fi
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 3: Lint + format check
+  # ────────────────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Run ruff check
+        run: ruff check agentkv/ tests/ bench/
+
+      - name: Run ruff format check
+        run: ruff format --check agentkv/ tests/ bench/
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 4: Package install smoke test
+  # Verifies the package installs cleanly and the version string is importable.
+  # ────────────────────────────────────────────────────────────────────────────
+  install-smoke:
+    name: Install Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install (CPU wheel)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e .
+
+      - name: Smoke test import
+        run: |
+          python -c "
+          import agentkv
+          print('Version:', agentkv.__version__)
+          print('Install: OK')
+          "

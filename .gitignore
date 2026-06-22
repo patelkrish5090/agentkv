@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg-link
+.installed.cfg
+pip-wheel-metadata/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# CUDA build artifacts
+*.o
+*.a
+*.fatbin
+*.cubin
+*.ptx
+*.sass
+
+# Triton cache
+~/.triton/
+.triton_cache/
+
+# PyTorch
+*.pt
+*.pth
+
+# Benchmarks output
+bench/results/
+bench/*.csv
+bench/*.png
+bench/*.svg
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+
+# Distribution
+*.tar.gz
+*.zip
+
+# Environment files
+.env
+.env.local
+
+# Docs build
+docs/_build/
+site/

@@ -1,0 +1,99 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "agentkv"
+version = "0.1.0.dev0"
+description = "GPU-resident CoW radix-tree KV-cache memory manager for agentic LLM workloads"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "AgentKV Contributors" }]
+keywords = ["llm", "kv-cache", "gpu", "triton", "vllm", "sglang", "tree-of-thought"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.9"
+dependencies = [
+    # PyTorch is the runtime substrate for GPU tensor operations.
+    # We do NOT pin a version here because users likely have a specific CUDA-matched
+    # torch already installed. Callers should ensure torch >= 2.0.
+    "torch>=2.0",
+    # triton: device kernel authoring without CUDA C++ toolchain.
+    # Triton is bundled with torch >= 2.1 on Linux/Mac; on Windows it must be
+    # installed separately. We list it as optional below.
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+# GPU kernel path (Triton). Not available natively on Windows — users on Windows
+# should use WSL2 for GPU development.
+gpu = [
+    "triton>=2.1; sys_platform != 'win32'",
+]
+# Development / testing extras
+dev = [
+    "pytest>=7.4",
+    "pytest-xdist",         # parallel test execution
+    "pytest-timeout",
+    "coverage[toml]",
+    "hypothesis>=6.82",     # property-based testing for the stress suite
+    "matplotlib>=3.7",      # benchmark charts
+    "pandas>=2.0",          # benchmark CSV processing
+]
+# Full integration extras (heavy; only install if you have vLLM / SGLang)
+integrations = [
+    "agentkv[gpu]",
+]
+
+[project.urls]
+Homepage = "https://github.com/agentkv/agentkv"
+"Bug Tracker" = "https://github.com/agentkv/agentkv/issues"
+Documentation = "https://github.com/agentkv/agentkv/tree/main/docs"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agentkv*"]
+
+[tool.setuptools.package-data]
+"agentkv" = ["py.typed"]
+
+# ── pytest ──────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+markers = [
+    "gpu: marks tests that require a CUDA-capable GPU (skipped in CPU-only CI)",
+    "slow: marks tests that take > 10 seconds",
+    "integration: marks end-to-end integration tests requiring installed frameworks",
+]
+timeout = 120
+
+# ── coverage ─────────────────────────────────────────────────────────────────
+[tool.coverage.run]
+source = ["agentkv"]
+omit = ["tests/*", "bench/*"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 60  # low bar for early dev; raise as codebase matures
+
+# ── ruff (linting) ───────────────────────────────────────────────────────────
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "SIM"]
+ignore = [
+    "E501",   # line too long — handled by formatter
+    "B008",   # do not perform function calls in default arguments
+]
