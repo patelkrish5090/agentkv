@@ -73,6 +73,26 @@ def bytes_of_past_kv(past_key_values) -> int:
     return total
 
 
+def clone_past_kv(past_key_values):
+    """Deep clone the HF KV cache so each agent can safely mutate it during generate().
+    
+    (AgentKV solves this naturally via CoW without cloning, but since we are 
+    using standard HF generate() here to simulate the outputs, we must clone).
+    """
+    if hasattr(past_key_values, 'key_cache'):
+        from transformers import DynamicCache
+        new_cache = DynamicCache()
+        for k, v in zip(past_key_values.key_cache, past_key_values.value_cache):
+            new_cache.key_cache.append(k.clone() if k is not None else None)
+            new_cache.value_cache.append(v.clone() if v is not None else None)
+        return new_cache
+    else:
+        return tuple(
+            tuple(t.clone() if t is not None else None for t in layer)
+            for layer in past_key_values
+        )
+
+
 def run_demo(
     model_name: str = "gpt2",
     device: str = "cuda",
@@ -205,10 +225,11 @@ def run_demo(
         cont_ids = tokenizer.encode(continuation, return_tensors="pt").to(device)
 
         t0 = time.perf_counter()
+        agent_past_kv = clone_past_kv(shared_past_kv)
         with torch.no_grad():
             gen_ids = model.generate(
                 cont_ids,
-                past_key_values=shared_past_kv,  # Shared prefix! Not copied.
+                past_key_values=agent_past_kv,  # Give each agent its own copy to mutate
                 max_new_tokens=new_tokens_per_agent,
                 do_sample=False,
                 pad_token_id=tokenizer.eos_token_id,
