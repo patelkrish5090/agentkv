@@ -79,18 +79,34 @@ def clone_past_kv(past_key_values):
     (AgentKV solves this naturally via CoW without cloning, but since we are 
     using standard HF generate() here to simulate the outputs, we must clone).
     """
-    if hasattr(past_key_values, 'key_cache'):
+    try:
         from transformers import DynamicCache
-        new_cache = DynamicCache()
-        for k, v in zip(past_key_values.key_cache, past_key_values.value_cache):
-            new_cache.key_cache.append(k.clone() if k is not None else None)
-            new_cache.value_cache.append(v.clone() if v is not None else None)
-        return new_cache
-    else:
-        return tuple(
-            tuple(t.clone() if t is not None else None for t in layer)
-            for layer in past_key_values
-        )
+        
+        # If it's a new-style DynamicCache
+        if hasattr(past_key_values, 'key_cache'):
+            new_cache = DynamicCache()
+            for k, v in zip(past_key_values.key_cache, past_key_values.value_cache):
+                new_cache.key_cache.append(k.clone() if k is not None else None)
+                new_cache.value_cache.append(v.clone() if v is not None else None)
+            return new_cache
+            
+        # If it's an old-style tuple, but we have DynamicCache available, 
+        # convert it to DynamicCache since generate() requires it now.
+        elif isinstance(past_key_values, tuple):
+            new_cache = DynamicCache()
+            for layer in past_key_values:
+                new_cache.key_cache.append(layer[0].clone() if layer[0] is not None else None)
+                new_cache.value_cache.append(layer[1].clone() if layer[1] is not None else None)
+            return new_cache
+            
+    except ImportError:
+        pass
+
+    # Fallback for old transformers (< 4.38)
+    return tuple(
+        tuple(t.clone() if t is not None else None for t in layer)
+        for layer in past_key_values
+    )
 
 
 def run_demo(
