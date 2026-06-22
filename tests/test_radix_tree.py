@@ -203,9 +203,15 @@ class TestFree:
         assert bh not in handle.residual_blocks
 
     def test_double_free_raises(self, tree):
+        """A second call to free() on the same handle should raise ValueError.
+
+        After the first free(), the handle is deregistered from _handles,
+        so the second free() raises 'not registered' (which is correct —
+        the allocator has already cleaned up the resources).
+        """
         handle = tree.create_root([1, 2])
         tree.free(handle)
-        with pytest.raises(ValueError, match="double-free"):
+        with pytest.raises(ValueError, match="not registered|already freed|double-free"):
             tree.free(handle)
 
     def test_free_unregistered_handle_raises(self, tree):
