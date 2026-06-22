@@ -156,6 +156,59 @@ class PoolConfig:
             **kwargs,
         )
 
+    @classmethod
+    def max_for_device(
+        cls,
+        fraction: float = 0.7,
+        block_size: int = 16,
+        num_layers: int = 32,
+        num_kv_heads: int = 8,
+        head_dim: int = 128,
+        dtype: str = "float16",
+        device: str = "cuda",
+        **kwargs,
+    ) -> "PoolConfig":
+        """Construct a PoolConfig that uses ``fraction`` of available GPU VRAM.
+
+        Queries ``torch.cuda.mem_get_info()`` to find free VRAM and sizes the
+        pool to ``fraction * free_vram``.  This is the safest way to create a
+        pool on a shared GPU (e.g. Google Colab T4) without hitting OOM.
+
+        Parameters
+        ----------
+        fraction : float
+            Fraction of *currently free* VRAM to use (default 0.7 = 70%).
+            Keep < 1.0 to leave room for PyTorch's own allocator overhead,
+            Triton's JIT cache, and the model weights if co-located.
+
+        Example
+        -------
+        >>> cfg = PoolConfig.max_for_device(fraction=0.6)
+        >>> print(cfg)  # shows how many blocks fit in 60% of free VRAM
+        """
+        import torch
+
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "max_for_device() requires a CUDA GPU. "
+                "Use PoolConfig(total_blocks=...) for CPU pools."
+            )
+
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device if device != "cpu" else 0)
+        budget_bytes = free_bytes * fraction
+        budget_gb = budget_bytes / (1024 ** 3)
+
+        return cls.from_capacity_gb(
+            capacity_gb=budget_gb,
+            block_size=block_size,
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+            device=device,
+            **kwargs,
+        )
+
     def __repr__(self) -> str:
         return (
             f"PoolConfig("

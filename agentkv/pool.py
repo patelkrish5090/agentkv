@@ -200,7 +200,17 @@ class AgentKVPool:
         """
         return self._tree.get_block_ids(handle)
 
-    # ── Introspection ─────────────────────────────────────────────────────────
+    def maybe_advance_epoch(self) -> None:
+        """Manually trigger an epoch advance to reclaim retired blocks.
+
+        Call this after ``free()`` if you need blocks to be immediately
+        returned to the pool (e.g. in tests or after a batch completes).
+        Normally the allocator advances the epoch automatically every
+        ``PoolConfig.epoch_interval`` operations, so you don't need to
+        call this in production code.
+        """
+        self._allocator.maybe_advance_epoch()
+
 
     def stats(self) -> dict:
         """Return a dict of pool-wide statistics.
