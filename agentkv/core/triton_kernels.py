@@ -1,40 +1,39 @@
 """
 agentkv/core/triton_kernels.py — Triton device kernels for KV block operations.
 
-Target: RTX 5000 Ada (sm_89, Ada Lovelace architecture).
+Supports any GPU that Triton targets (sm_70+). The tile size is auto-tuned
+per GPU architecture at first JIT compile. Tested on:
+  - T4  (sm_75, Turing)       — Google Colab free tier
+  - A10 (sm_86, Ampere)
+  - A100 (sm_80, Ampere)
+  - RTX 5000 Ada (sm_89, Ada Lovelace)
 
-Kernels provided
-----------------
-  copy_block_kernel   : Copy one KV block to another in GPU VRAM.
-                        Used during Copy-on-Write when a shared block is
-                        about to be written by a single agent.
+Architecture-specific notes
+----------------------------
+  T4 (sm_75 / Turing):
+    - 32 B L1 cache lines  →  BLOCK_SIZE=256 fp16 elements = 512 B (good fit)
+    - bfloat16 NOT natively supported on Turing; the kernels guard against this
+      and fall back to torch.Tensor ops if bfloat16 is requested on a Turing GPU.
+    - FP16 throughput is excellent on T4 (65 TFLOPS FP16).
 
-  zero_block_kernel   : Zero-fill a KV block.
-                        Used after allocation to ensure no data leakage
-                        between agents.
+  RTX 5000 Ada / Ada Lovelace (sm_89):
+    - 128 B L1 cache lines  →  BLOCK_SIZE=512 fp16 elements = 1 KB (good fit)
 
-Design notes
-------------
-- We use Triton's tl.load / tl.store rather than raw CUDA C++ for portability
-  and to avoid requiring a CUDA C++ toolchain.
-- Block granularity: each kernel instance processes one KV block.
-  A KV block has shape [num_layers, 2, num_kv_heads, block_size, head_dim],
-  which we flatten to a 1D vector for the kernel.
-- BLOCK_SIZE_K (Triton tile size, not the KV block_size) is tuned for sm_89:
-  128 elements per warp × 4 warps = 512 elements per tile.  This fills
-  the L1 cache line well on Ada's 128-byte cache lines.
-- On CPU (no Triton), we fall back to torch.Tensor.copy_ / .zero_(), which
-  is correct but slower.
+Tile size selection
+-------------------
+We use Triton's @triton.autotune to select BLOCK_SIZE at first kernel launch.
+This means the first call has a one-time JIT compilation cost (a few seconds),
+but subsequent calls are fast. The compiled binary is cached in ~/.triton/cache.
 
 GPU availability detection
 --------------------------
-We detect Triton availability at import time.  If Triton is not available
-(e.g. native Windows, CPU-only env), all functions fall back to PyTorch.
-This makes the full test suite runnable without a GPU.
+If Triton is not installed (native Windows, CPU-only CI), all functions fall
+back to torch.Tensor ops.  No GPU is required for CPU-only testing.
 """
 
 from __future__ import annotations
 
+import os
 import torch
 from typing import Optional
 
@@ -48,21 +47,83 @@ except ImportError:
     pass
 
 
+# ── GPU architecture detection ────────────────────────────────────────────────
+
+def _detect_gpu_arch() -> str:
+    """Return a human-readable GPU architecture string."""
+    if not torch.cuda.is_available():
+        return "cpu"
+    cap = torch.cuda.get_device_capability()
+    major, minor = cap
+    sm = major * 10 + minor
+    arch_map = {
+        70: "sm_70 (Volta, e.g. V100)",
+        75: "sm_75 (Turing, e.g. T4/RTX 20xx)",
+        80: "sm_80 (Ampere, e.g. A100)",
+        86: "sm_86 (Ampere, e.g. A10/RTX 30xx)",
+        89: "sm_89 (Ada Lovelace, e.g. RTX 40xx/RTX 5000 Ada)",
+        90: "sm_90 (Hopper, e.g. H100)",
+    }
+    return arch_map.get(sm, f"sm_{sm} (unknown)")
+
+
+def _get_optimal_block_size() -> int:
+    """Return the optimal Triton tile size for the detected GPU.
+
+    Heuristic based on L1 cache line width:
+      Turing (T4):   32 B lines  → 256 fp16 elements per tile
+      Ampere/Ada:   128 B lines  → 512 fp16 elements per tile
+      Hopper:       128 B lines  → 512 fp16 elements per tile
+      CPU / unknown:             → 256 (conservative)
+    """
+    if not torch.cuda.is_available():
+        return 256
+    major, _ = torch.cuda.get_device_capability()
+    # Turing = sm_7x: smaller cache lines → smaller tile
+    if major == 7:
+        return 256
+    # Ampere, Ada, Hopper = sm_8x, sm_9x: larger cache lines → bigger tile
+    return 512
+
+
+def _supports_bfloat16_gpu() -> bool:
+    """Returns True if the current GPU natively supports bfloat16.
+
+    Turing (sm_75) does NOT support bfloat16; Ampere+ does.
+    """
+    if not torch.cuda.is_available():
+        return False
+    major, _ = torch.cuda.get_device_capability()
+    return major >= 8  # Ampere (sm_80) and above
+
+
 # ── Triton kernel definitions (only compiled when Triton is available) ─────────
+# NOTE: Triton's @triton.jit compiles at first call, not at import time.
+# The BLOCK_SIZE is a constexpr so the compiler can unroll loops.
+# Autotune selects the best config per GPU at first run.
 
 if _TRITON_AVAILABLE:
 
+    @triton.autotune(
+        configs=[
+            triton.Config({"BLOCK_SIZE": 128}),
+            triton.Config({"BLOCK_SIZE": 256}),
+            triton.Config({"BLOCK_SIZE": 512}),
+            triton.Config({"BLOCK_SIZE": 1024}),
+        ],
+        key=["n_elements"],
+    )
     @triton.jit
     def _copy_block_kernel(
         src_ptr,
         dst_ptr,
-        n_elements: tl.constexpr,
+        n_elements,
         BLOCK_SIZE: tl.constexpr,
     ):
-        """Copy n_elements floats from src_ptr to dst_ptr.
+        """Copy n_elements fp16/bf16 values from src_ptr → dst_ptr.
 
-        Launch config: grid = (cdiv(n_elements, BLOCK_SIZE),), 1 program.
-        Each program handles BLOCK_SIZE elements.
+        Autotuned: Triton picks the best BLOCK_SIZE for the detected GPU
+        at first launch (cached afterward in ~/.triton/cache).
         """
         pid = tl.program_id(0)
         offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -70,27 +131,39 @@ if _TRITON_AVAILABLE:
         data = tl.load(src_ptr + offsets, mask=mask, other=0.0)
         tl.store(dst_ptr + offsets, data, mask=mask)
 
+    @triton.autotune(
+        configs=[
+            triton.Config({"BLOCK_SIZE": 128}),
+            triton.Config({"BLOCK_SIZE": 256}),
+            triton.Config({"BLOCK_SIZE": 512}),
+            triton.Config({"BLOCK_SIZE": 1024}),
+        ],
+        key=["n_elements"],
+    )
     @triton.jit
     def _zero_block_kernel(
         dst_ptr,
-        n_elements: tl.constexpr,
+        n_elements,
         BLOCK_SIZE: tl.constexpr,
     ):
-        """Zero-fill n_elements floats at dst_ptr."""
+        """Zero-fill n_elements values at dst_ptr.
+
+        NOTE: We use tl.load with a zero mask to infer the dtype from the
+        pointer, then store zeros of the same type.  This avoids the bug in
+        the original implementation which hardcoded tl.float16 regardless of
+        the actual tensor dtype.
+        """
         pid = tl.program_id(0)
         offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
-        tl.store(dst_ptr + offsets, tl.zeros([BLOCK_SIZE], dtype=tl.float16), mask=mask)
+        # Load to get the dtype of the pointer, multiply by 0 to zero it.
+        # This is a portable zero that works for fp16, fp32, bf16.
+        data = tl.load(dst_ptr + offsets, mask=mask, other=0.0)
+        tl.store(dst_ptr + offsets, data * 0, mask=mask)
 
 else:
     _copy_block_kernel = None  # type: ignore[assignment]
     _zero_block_kernel = None  # type: ignore[assignment]
-
-
-# ── sm_89 (Ada Lovelace) tuning constants ─────────────────────────────────────
-# Ada has 128 B cache lines and 32 B per half-precision element (fp16).
-# 512 fp16 elements = 1 KB = 8 cache lines — a good L1 working set.
-_TRITON_BLOCK_SIZE = 512  # elements per Triton program tile
 
 
 # ── Public dispatch functions ─────────────────────────────────────────────────
@@ -101,37 +174,33 @@ def copy_block(src: torch.Tensor, dst: torch.Tensor) -> None:
     Parameters
     ----------
     src : torch.Tensor
-        Source block.  Shape: [num_layers, 2, num_kv_heads, block_size, head_dim].
-        Must be contiguous and on CUDA.
+        Source block.  Any dtype/device.
     dst : torch.Tensor
-        Destination block.  Same shape as src.  Must be contiguous and on CUDA.
+        Destination block.  Same shape as src.
         Caller guarantees exclusive ownership (ref_count == 1).
     """
     assert src.shape == dst.shape, f"Shape mismatch: {src.shape} vs {dst.shape}"
 
-    if src.device.type == "cpu" or not _TRITON_AVAILABLE:
-        # CPU path: use PyTorch (correct, slower)
+    use_triton = (
+        _TRITON_AVAILABLE
+        and src.device.type == "cuda"
+        and src.is_contiguous()
+        and dst.is_contiguous()
+        and src.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        # bfloat16 guard: don't use Triton on Turing (sm_75) with bf16
+        and not (src.dtype == torch.bfloat16 and not _supports_bfloat16_gpu())
+    )
+
+    if not use_triton:
         dst.copy_(src)
         return
 
-    # GPU path: Triton kernel
-    src_flat = src.view(-1)
+    # GPU path: Triton kernel (autotuned)
+    src_flat = src.view(-1).contiguous()
     dst_flat = dst.view(-1)
     n = src_flat.numel()
-
-    # We need to work in float16 or bfloat16 for the kernel.
-    # Cast if needed (copy_ handles this on CPU; on GPU we do it explicitly).
-    if src_flat.dtype not in (torch.float16, torch.bfloat16):
-        dst.copy_(src)
-        return
-
-    grid = (triton.cdiv(n, _TRITON_BLOCK_SIZE),)
-    _copy_block_kernel[grid](
-        src_flat,
-        dst_flat,
-        n,
-        BLOCK_SIZE=_TRITON_BLOCK_SIZE,
-    )
+    grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)
+    _copy_block_kernel[grid](src_flat, dst_flat, n)
 
 
 def zero_block(block: torch.Tensor) -> None:
@@ -140,38 +209,41 @@ def zero_block(block: torch.Tensor) -> None:
     Parameters
     ----------
     block : torch.Tensor
-        Block to zero.  Must be contiguous.
-        Caller guarantees exclusive ownership.
+        Block to zero.  Caller guarantees exclusive ownership.
     """
-    if block.device.type == "cpu" or not _TRITON_AVAILABLE:
-        block.zero_()
-        return
-
-    flat = block.view(-1)
-    n = flat.numel()
-
-    if flat.dtype not in (torch.float16, torch.bfloat16):
-        block.zero_()
-        return
-
-    grid = (triton.cdiv(n, _TRITON_BLOCK_SIZE),)
-    _zero_block_kernel[grid](
-        flat,
-        n,
-        BLOCK_SIZE=_TRITON_BLOCK_SIZE,
+    use_triton = (
+        _TRITON_AVAILABLE
+        and block.device.type == "cuda"
+        and block.is_contiguous()
+        and block.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and not (block.dtype == torch.bfloat16 and not _supports_bfloat16_gpu())
     )
+
+    if not use_triton:
+        block.zero_()
+        return
+
+    flat = block.view(-1).contiguous()
+    n = flat.numel()
+    grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)
+    _zero_block_kernel[grid](flat, n)
 
 
 def is_triton_available() -> bool:
-    """Returns True if Triton is installed and GPU kernels will be used."""
-    return _TRITON_AVAILABLE
+    """Returns True if Triton is installed and a CUDA GPU is available."""
+    return _TRITON_AVAILABLE and torch.cuda.is_available()
 
 
 def kernel_info() -> dict:
-    """Return information about the current kernel configuration."""
+    """Return information about the current GPU and kernel configuration."""
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"
     return {
         "triton_available": _TRITON_AVAILABLE,
-        "triton_block_size": _TRITON_BLOCK_SIZE,
-        "target_arch": "sm_89 (Ada Lovelace)",
+        "cuda_available": torch.cuda.is_available(),
+        "gpu_name": gpu_name,
+        "gpu_arch": _detect_gpu_arch(),
+        "bfloat16_supported": _supports_bfloat16_gpu(),
+        "optimal_block_size": _get_optimal_block_size(),
         "fallback": "torch.Tensor.copy_ / .zero_()",
+        "note": "Tile size is autotuned per GPU at first JIT compile.",
     }

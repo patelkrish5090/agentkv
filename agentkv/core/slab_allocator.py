@@ -49,6 +49,7 @@ via ``get_block_tensor()``.
 from __future__ import annotations
 
 import threading
+import warnings
 from collections import deque
 from typing import Deque, Dict, Optional
 
@@ -56,6 +57,7 @@ import torch
 
 from agentkv.core.config import PoolConfig
 from agentkv.core.reclamation import EpochReclaimer
+from agentkv.core import triton_kernels as _tk
 
 # Sentinel value meaning "no block"
 INVALID_BLOCK: int = -1
@@ -118,11 +120,38 @@ class SlabAllocator:
         self._cfg = config
         self._lock = threading.Lock()
 
+        # ── bfloat16 guard for Turing GPUs (T4 = sm_75) ──────────────────────
+        # T4 does not support bfloat16 natively.  Warn early rather than
+        # crashing inside a Triton kernel deep in a benchmark.
+        if (
+            config.dtype == "bfloat16"
+            and config.device.startswith("cuda")
+            and not _tk._supports_bfloat16_gpu()
+        ):
+            warnings.warn(
+                "bfloat16 is not natively supported on this GPU (Turing / sm_75, e.g. T4). "
+                "The pool will use float16 instead to avoid correctness issues. "
+                "Pass dtype='float16' explicitly to suppress this warning.",
+                stacklevel=2,
+            )
+            config = PoolConfig(
+                total_blocks=config.total_blocks,
+                block_size=config.block_size,
+                num_layers=config.num_layers,
+                num_kv_heads=config.num_kv_heads,
+                head_dim=config.head_dim,
+                dtype="float16",
+                device=config.device,
+                max_agents=config.max_agents,
+                epoch_interval=config.epoch_interval,
+            )
+            self._cfg = config
+
         # ── KV data tensor ────────────────────────────────────────────────────
         # Shape: [total_blocks, num_layers, 2, num_kv_heads, block_size, head_dim]
         # The factor of 2 is for K and V.
-        # Stored on config.device.  On CPU this is a regular torch tensor.
-        # On CUDA this is pinned device memory.
+        # On CUDA this lives in device global memory (no pinning needed;
+        # the GPU reads it directly from its own DRAM).
         self._kv_data: torch.Tensor = torch.zeros(
             config.total_blocks,
             config.num_layers,
@@ -135,16 +164,19 @@ class SlabAllocator:
         )
 
         # ── Reference count array (CPU, int32) ───────────────────────────────
-        # We keep ref counts on CPU even for GPU-device pools.  Ref count
-        # operations are far less frequent than kernel invocations, and keeping
-        # them CPU-resident avoids device→host round-trips in the hot path.
+        # Kept on CPU even for CUDA pools — no device→host round-trips needed.
         self._ref_counts: torch.Tensor = torch.zeros(
             config.total_blocks, dtype=torch.int32
         )
 
         # ── Free list (LIFO deque) ────────────────────────────────────────────
-        # Pre-populate with all block IDs.
         self._free_list: Deque[int] = deque(range(config.total_blocks))
+
+        # ── Deferred free queue ───────────────────────────────────────────────
+        # Avoids lock-order deadlock between self._lock and reclaimer._lock.
+        # _do_free() (called from inside reclaimer._lock) pushes here;
+        # _drain_deferred() (called under self._lock) moves IDs to _free_list.
+        self._deferred_free: deque = deque()
 
         # ── Epoch-based reclaimer ─────────────────────────────────────────────
         self._reclaimer = EpochReclaimer(free_callback=self._do_free)
@@ -266,12 +298,9 @@ class SlabAllocator:
     def copy_block(self, src: BlockHandle, dst: BlockHandle) -> None:
         """Copy KV data from src block to dst block (CPU or GPU).
 
-        Used during CoW: when a shared block needs to be written, the agent
-        first allocates a fresh block and calls copy_block to clone the data,
-        then drops its reference to the shared block.
-
-        On CUDA, this dispatches to the Triton copy_block kernel (Phase 1b).
-        On CPU (or if Triton is unavailable), uses torch.copy_.
+        On CUDA, dispatches to the Triton copy_block kernel (autotuned for
+        the detected GPU architecture, including T4 sm_75).
+        On CPU (or if Triton is unavailable), uses torch.Tensor.copy_.
         """
         self._validate_handle(src)
         self._validate_handle(dst)
@@ -282,12 +311,19 @@ class SlabAllocator:
                     f"(got {self._ref_counts[dst.block_id].item()}). "
                     "Only exclusively-owned blocks may be written."
                 )
-        # Data copy outside the lock — this is a potentially expensive GPU op.
+        # Data copy is outside the lock — potentially expensive GPU op.
         # The ref count check above guarantees dst is exclusively ours.
-        self._kv_data[dst.block_id].copy_(self._kv_data[src.block_id])
+        _tk.copy_block(
+            self._kv_data[src.block_id],
+            self._kv_data[dst.block_id],
+        )
 
     def zero_block(self, handle: BlockHandle) -> None:
-        """Zero-fill a block's KV data (e.g. for security / fresh allocation)."""
+        """Zero-fill a block's KV data (security / fresh allocation).
+
+        On CUDA, dispatches to the Triton zero_block kernel.
+        Falls back to torch.Tensor.zero_() on CPU.
+        """
         self._validate_handle(handle)
         with self._lock:
             if self._ref_counts[handle.block_id].item() != 1:
@@ -295,7 +331,7 @@ class SlabAllocator:
                     f"zero_block: block {handle.block_id} must be exclusively owned "
                     f"(ref_count=1, got {self._ref_counts[handle.block_id].item()})"
                 )
-        self._kv_data[handle.block_id].zero_()
+        _tk.zero_block(self._kv_data[handle.block_id])
 
     # ── Epoch / reclamation ───────────────────────────────────────────────────
 
@@ -409,26 +445,6 @@ class SlabAllocator:
             raise ValueError(
                 f"block_id {handle.block_id} out of range [0, {self._cfg.total_blocks})"
             )
-
-    # ── Initialization helper ─────────────────────────────────────────────────
-
-    def __init_deferred(self) -> None:
-        """Set up _deferred_free.  Called at the end of __init__."""
-        self._deferred_free: deque = deque()
-
-
-# Monkey-patch __init__ to call __init_deferred at the end.
-# (We define the deque here rather than at the top of __init__ to make the
-# ordering of the lock-order comment obvious in the doc above.)
-_original_init = SlabAllocator.__init__
-
-
-def _patched_init(self, config: PoolConfig) -> None:
-    _original_init(self, config)
-    self._deferred_free: deque = deque()
-
-
-SlabAllocator.__init__ = _patched_init  # type: ignore[method-assign]
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
