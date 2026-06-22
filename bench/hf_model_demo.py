@@ -49,11 +49,27 @@ import torch
 
 
 def bytes_of_past_kv(past_key_values) -> int:
-    """Return the total byte size of a HuggingFace past_key_values cache."""
+    """Return total byte size of a HuggingFace past_key_values cache.
+
+    Handles both formats:
+      - Old (transformers < 4.38): tuple of (key, value) tensors per layer
+      - New (transformers >= 4.38): DynamicCache object with .key_cache / .value_cache
+    """
     total = 0
-    for layer_kv in past_key_values:
-        for tensor in layer_kv:  # (key, value)
-            total += tensor.numel() * tensor.element_size()
+    # New-style: DynamicCache has .key_cache and .value_cache lists
+    if hasattr(past_key_values, 'key_cache'):
+        for t in past_key_values.key_cache:
+            if t is not None:
+                total += t.numel() * t.element_size()
+        for t in past_key_values.value_cache:
+            if t is not None:
+                total += t.numel() * t.element_size()
+    else:
+        # Old-style: tuple of (key_tensor, value_tensor) per layer
+        for layer_kv in past_key_values:
+            for tensor in layer_kv:
+                if tensor is not None:
+                    total += tensor.numel() * tensor.element_size()
     return total
 
 
@@ -87,7 +103,7 @@ def run_demo(
     torch_dtype = torch.float16 if device == "cuda" else torch.float32
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch_dtype,
+        dtype=torch_dtype,
         low_cpu_mem_usage=True,
     ).to(device).eval()
 
