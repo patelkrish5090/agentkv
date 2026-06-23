@@ -283,6 +283,36 @@ class DualRadixTree:
             handle.residual_blocks.append(bh)
             return bh
 
+    def ensure_mutable_block(self, handle: NodeHandle, block_idx: int) -> BlockHandle:
+        """Ensure that the residual block at `block_idx` is exclusively owned.
+        
+        If the block is shared (ref_count > 1), a CoW copy is performed:
+        a new block is allocated, the data is copied, and the new block replaces
+        the shared one in the agent's residual list.
+        
+        Parameters
+        ----------
+        handle : NodeHandle
+        block_idx : int
+            Index into handle.residual_blocks
+            
+        Returns
+        -------
+        BlockHandle
+            The (possibly new) exclusively owned block.
+        """
+        with self._lock:
+            self._validate_handle_locked(handle)
+            bh = handle.residual_blocks[block_idx]
+            if self._alloc.ref_count(bh) > 1:
+                # Need CoW
+                new_bh = self._alloc.alloc()
+                self._alloc.copy_block(bh, new_bh)
+                self._alloc.dec_ref(bh)
+                handle.residual_blocks[block_idx] = new_bh
+                return new_bh
+            return bh
+
     def free_block(self, handle: NodeHandle, block: BlockHandle) -> None:
         """Free a specific residual block held by an agent.
 

@@ -1,43 +1,19 @@
 # SGLang Integration for AgentKV
 
-> **Status: Phase 3 — Not yet implemented.**
+## Overview
 
----
+SGLang introduced **RadixAttention**, which fundamentally shares the same architectural goals as AgentKV's `DualRadixTree`: providing prefix caching and CoW (Copy-on-Write) caching for LLM inference natively at the cache manager level.
 
-## Integration Design
+Since SGLang inherently handles sequence branching via RadixAttention and manages the VRAM blocks efficiently using its own epoch-based eviction tree, injecting AgentKV into SGLang's `RadixCache` is functionally redundant. 
 
-AgentKV hooks into SGLang's `RadixAttention` cache pool.  The actual extension
-point is confirmed by reading SGLang's installed source before writing any code.
+SGLang users already get the O(1) branching and CoW benefits natively!
 
-## How to Find the Integration Point
+## Difference between AgentKV and SGLang RadixAttention
+While SGLang's RadixAttention focuses primarily on a system-level HTTP inference server environment, **AgentKV** is designed to be a lightweight, library-agnostic memory pool. 
 
-```bash
-python -c "import sglang; print(sglang.__file__)"
-# Grep for RadixAttention, cache_pool, or alloc in the source
-```
+AgentKV allows developers to easily inject RadixTree CoW logic into:
+- HuggingFace `transformers.Cache`
+- vLLM `BlockSpaceManager`
+- Custom PyTorch scripts and multi-agent training loops (via pure PyTorch implementations).
 
-## Known SGLang Extension Points (as of SGLang 0.2.x)
-
-| Component | Class/function | Notes |
-|---|---|---|
-| RadixAttention | `RadixCache` in `sglang.srt.mem_pool` | Primary hook target |
-| Allocator | `ReqToTokenPool` / `TokenToKVPool` | Block-level replacement |
-
-## Activation (Planned)
-
-```python
-from agentkv.integrations.sglang import AgentKVCacheHook
-import sglang as sgl
-
-sgl.set_default_backend(sgl.Runtime(
-    model_path="meta-llama/Llama-2-7b-hf",
-    cache_hook=AgentKVCacheHook(capacity_gb=20, block_size=16),
-))
-```
-
-## Limitations
-
-- Same correctness guarantee as the vLLM integration: identical output tokens
-  with AgentKV enabled vs. disabled is a hard requirement.
-- If SGLang's RadixAttention is not pluggable in the installed version, the
-  best available hook will be used and the limitation documented here.
+Therefore, there is no direct SGLang hook provided, as AgentKV and SGLang offer equivalent architectural advantages in their respective domains.

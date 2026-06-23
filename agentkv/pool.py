@@ -145,6 +145,17 @@ class AgentKVPool:
         """
         self._tree.allocate_block(handle)
 
+    def ensure_mutable_block(self, handle: NodeHandle, block_idx: int) -> None:
+        """Ensure that the residual block at `block_idx` is exclusively owned,
+        performing a CoW copy if necessary.
+        
+        Parameters
+        ----------
+        handle : NodeHandle
+        block_idx : int
+        """
+        self._tree.ensure_mutable_block(handle, block_idx)
+
     def append_tokens(self, handle: NodeHandle, tokens: List[int]) -> None:
         """Record new generated tokens for an agent.
 

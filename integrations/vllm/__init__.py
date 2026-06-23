@@ -1,6 +1,34 @@
 """
-agentkv integrations — vLLM KV cache backend.
+vLLM Integration for AgentKV
 
-Phase 3 implementation.  See README.md in this directory for the integration
-design and known limitations of the installed vLLM version.
+This module patches vLLM to use AgentKVBlockManager as its default block allocator.
 """
+from typing import Any
+import importlib
+
+def patch_vllm() -> None:
+    """
+    Patches vLLM to use AgentKVBlockManager instead of BlockSpaceManagerV2.
+    Must be called before initializing the vLLM LLM or AsyncLLMEngine.
+    """
+    try:
+        import vllm.core.interfaces
+    except ImportError:
+        raise ImportError("vLLM is not installed. Please install vllm>=0.4.0.")
+
+    from .block_manager import AgentKVBlockManager
+
+    # Store the original just in case
+    original_get_class = vllm.core.interfaces.BlockSpaceManager.get_block_space_manager_class
+
+    def patched_get_class(version: str) -> Any:
+        if version.lower() == "v2":
+            return AgentKVBlockManager
+        return original_get_class(version)
+
+    # Apply the monkey patch
+    vllm.core.interfaces.BlockSpaceManager.get_block_space_manager_class = staticmethod(patched_get_class)
+    
+    print("AgentKV: Successfully patched vLLM to use AgentKVBlockManager!")
+
+__all__ = ["patch_vllm", "AgentKVBlockManager"]

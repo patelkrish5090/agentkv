@@ -17,6 +17,7 @@ from agentkv.pool import AgentKVPool
 from agentkv.core.radix_tree import CoWRadixTree, DualRadixTree
 from agentkv.core.slab_allocator import SlabAllocator
 from agentkv.core.config import PoolConfig
+from agentkv.hf_cache import AgentKVCache
 
 __all__ = [
     "__version__",
@@ -25,4 +26,5 @@ __all__ = [
     "DualRadixTree",
     "SlabAllocator",
     "PoolConfig",
+    "AgentKVCache",
 ]
