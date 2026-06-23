@@ -241,7 +241,8 @@ def run_demo(
         with torch.no_grad():
             gen_ids = model.generate(
                 cont_ids,
-                past_key_values=agent_cache,   # DynamicCache — always accepted
+                attention_mask=torch.ones_like(cont_ids),
+                past_key_values=agent_cache,
                 max_new_tokens=new_tokens_per_agent,
                 do_sample=False,
                 pad_token_id=tokenizer.eos_token_id,
@@ -249,9 +250,14 @@ def run_demo(
             )
         gen_ms = (time.perf_counter() - t0) * 1000
 
-        full_text    = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
+        # Decode: gen_ids contains [cont_tokens + generated_tokens]
+        # Prepend shared prompt text so the full sentence reads naturally.
+        cont_text     = tokenizer.decode(cont_ids[0], skip_special_tokens=True)
+        gen_only_text = tokenizer.decode(gen_ids[0][cont_ids.shape[1]:], skip_special_tokens=True)
+        full_sentence = shared_prompt + " " + cont_text.strip() + " " + gen_only_text.strip()
+
         new_tok_count = gen_ids.shape[1] - cont_ids.shape[1]
-        results.append((cont.strip(), full_text))
+        results.append((cont.strip(), full_sentence))
         child_new_tok_counts.append(new_tok_count)
 
         # Track new blocks in AgentKV
@@ -265,11 +271,9 @@ def run_demo(
     # ── 5. Results ────────────────────────────────────────────────────────────
     print(f"\n[5/5] Generated text\n{'='*60}")
     print(f"\nShared prefix: \"{shared_prompt}\"\n")
-    for i, (cont, text) in enumerate(results):
-        print(f"Agent {i+1}  (+\"{cont}\")")
-        # Show the full generated output (trimmed to 150 chars)
-        display = f"{shared_prompt}{text}"
-        print(f"        → {display[:150]}{'…' if len(display)>150 else ''}")
+    for i, (cont, sentence) in enumerate(results):
+        print(f"Agent {i+1}  (+\"{cont}\"): ")
+        print(f"   {sentence[:180]}{'…' if len(sentence)>180 else ''}")
         print()
 
     # ── Memory analysis ───────────────────────────────────────────────────────
