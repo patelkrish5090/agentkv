@@ -240,18 +240,32 @@ def run_stress_test(
         round_gen_ms = []
         round_toks   = []
 
+        gen_device = "cuda" if device == "cuda" else device
+        prompt_ids = inputs.input_ids.to(gen_device)   # [1, prompt_len]
+
         for i, (agent, query) in enumerate(zip(agents, queries)):
-            q_ids = tokenizer.encode(query, return_tensors="pt").to(
-                "cuda" if device == "cuda" else device
-            )
+            # Encode the query (agent's unique question)
+            q_ids = tokenizer.encode(query, return_tensors="pt").to(gen_device)
+
+            # KEY FIX: pass [prompt_ids | q_ids] as the full context to generate().
+            #
+            # Why: generate() with past_key_values internally trims input_ids to
+            #   input_ids[:, past_length:]
+            # If we only pass q_ids (shorter than past_length=106), the trimmed
+            # result is empty → crash "cannot reshape tensor of 0 elements".
+            # Passing full_ids (prompt + query) gives:
+            #   trimmed = full_ids[:, 106:] = q_ids  ← correct, non-empty
+            full_ids  = torch.cat([prompt_ids, q_ids], dim=1)     # [1, prompt_len + q_len]
+            full_mask = torch.ones_like(full_ids)                  # full causal mask
+
             agent_cache = clone_cache(shared_cache)
 
             t0 = time.perf_counter()
             with torch.no_grad():
                 gen_ids = model.generate(
-                    q_ids,
-                    attention_mask=torch.ones_like(q_ids),
-                    past_key_values=agent_cache,
+                    full_ids,
+                    attention_mask=full_mask,
+                    past_key_values=agent_cache,     # cache has prompt_len tokens
                     max_new_tokens=new_tokens,
                     do_sample=False,
                     pad_token_id=tokenizer.eos_token_id,
@@ -259,8 +273,10 @@ def run_stress_test(
                 )
             gen_ms = (time.perf_counter() - t0) * 1000
 
-            new_tok_count = gen_ids.shape[1] - q_ids.shape[1]
-            tps           = new_tok_count / (gen_ms / 1000)
+            # gen_ids = [q_ids_trimmed + new_generated_tokens]
+            # The trimmed q_ids part is already in gen_ids[0]; new tokens start after
+            new_tok_count = max(0, gen_ids.shape[1] - q_ids.shape[1])
+            tps           = new_tok_count / (gen_ms / 1000) if new_tok_count > 0 else 0
             round_gen_ms.append(gen_ms)
             round_toks.append(new_tok_count)
 
@@ -268,7 +284,9 @@ def run_stress_test(
             for _ in range(n_new_blks):
                 pool.allocate_block(agent)
 
-            gen_text = tokenizer.decode(gen_ids[0][q_ids.shape[1]:], skip_special_tokens=True)
+            # Decode only the newly generated tokens (after the query)
+            gen_only_ids = gen_ids[0][q_ids.shape[1]:]
+            gen_text = tokenizer.decode(gen_only_ids, skip_special_tokens=True)
             print(f"     Agent {i+1} [{gen_ms:.0f}ms | {new_tok_count}tok | {tps:.0f}tok/s]: "
                   f"\"{gen_text[:70].replace(chr(10), ' ')}{'…' if len(gen_text)>70 else ''}\"")
 

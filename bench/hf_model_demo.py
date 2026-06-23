@@ -228,9 +228,15 @@ def run_demo(
 
     results              = []
     child_new_tok_counts = []
+    prompt_ids = inputs.input_ids  # keep a reference to prompt tokens
 
     for i, (agent, cont) in enumerate(zip(agents, continuations)):
         cont_ids = tokenizer.encode(cont, return_tensors="pt").to(device)
+
+        # Full context = prompt tokens + continuation tokens.
+        # generate() trims to full_ids[:, past_len:] = cont_ids (non-empty).
+        full_ids  = torch.cat([prompt_ids.to(device), cont_ids], dim=1)
+        full_mask = torch.ones_like(full_ids)
 
         # Clone the shared DynamicCache for this agent.
         # generate() appends new KVs in place, so each agent needs its own copy.
@@ -240,8 +246,8 @@ def run_demo(
 
         with torch.no_grad():
             gen_ids = model.generate(
-                cont_ids,
-                attention_mask=torch.ones_like(cont_ids),
+                full_ids,
+                attention_mask=full_mask,
                 past_key_values=agent_cache,
                 max_new_tokens=new_tokens_per_agent,
                 do_sample=False,
@@ -253,10 +259,10 @@ def run_demo(
         # Decode: gen_ids contains [cont_tokens + generated_tokens]
         # Prepend shared prompt text so the full sentence reads naturally.
         cont_text     = tokenizer.decode(cont_ids[0], skip_special_tokens=True)
-        gen_only_text = tokenizer.decode(gen_ids[0][cont_ids.shape[1]:], skip_special_tokens=True)
+        gen_only_text = tokenizer.decode(gen_ids[0][full_ids.shape[1]:], skip_special_tokens=True)
         full_sentence = shared_prompt + " " + cont_text.strip() + " " + gen_only_text.strip()
 
-        new_tok_count = gen_ids.shape[1] - cont_ids.shape[1]
+        new_tok_count = max(0, gen_ids.shape[1] - full_ids.shape[1])
         results.append((cont.strip(), full_sentence))
         child_new_tok_counts.append(new_tok_count)
 
