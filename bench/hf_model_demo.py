@@ -41,18 +41,26 @@ import torch
 
 
 # ── HF Cache helpers ──────────────────────────────────────────────────────────
+#
+# DynamicCache internal attributes (key_cache, value_cache) have shifted
+# between transformers versions.  We use ONLY the stable public API:
+#   - DynamicCache.update(k, v, layer_idx)  — to build / populate
+#   - DynamicCache.to_legacy_cache()        — to iterate for byte counting
+#   - copy.deepcopy()                       — to clone
+
+import copy
+
 
 def bytes_of_cache(cache) -> int:
-    """Return the total byte size of a HF DynamicCache or legacy tuple cache."""
+    """Return the total byte size of a HF cache (any version)."""
     total = 0
-    if hasattr(cache, "key_cache"):          # DynamicCache
-        for t in cache.key_cache:
-            if t is not None:
-                total += t.numel() * t.element_size()
-        for t in cache.value_cache:
-            if t is not None:
-                total += t.numel() * t.element_size()
-    else:                                     # legacy tuple-of-tuples
+    try:
+        # DynamicCache: to_legacy_cache() → tuple of (K, V) per layer
+        for k, v in cache.to_legacy_cache():
+            total += k.numel() * k.element_size()
+            total += v.numel() * v.element_size()
+    except Exception:
+        # Fallback: raw tuple-of-tuples from very old or very new models
         for layer_kv in cache:
             for t in layer_kv:
                 if t is not None:
@@ -61,39 +69,39 @@ def bytes_of_cache(cache) -> int:
 
 
 def to_dynamic_cache(past_key_values):
-    """Convert any past_key_values format to DynamicCache.
+    """Normalise any past_key_values to a DynamicCache.
 
-    MUST be called right after model() forward — before any generate() call.
-    transformers >= 4.41 rejects tuples inside generate(); we normalise here.
+    Called IMMEDIATELY after model() forward — before any generate() call.
+    transformers >= 4.41 hard-rejects tuples in generate(); we fix that here.
     """
     from transformers import DynamicCache
 
+    # Already correct — nothing to do
     if isinstance(past_key_values, DynamicCache):
-        return past_key_values                # Already the right type
+        return past_key_values
 
-    # Legacy tuple-of-tuples: ((K0, V0), (K1, V1), ...)
+    # Try the official helper introduced in transformers 4.44
+    if hasattr(DynamicCache, "from_legacy_cache"):
+        return DynamicCache.from_legacy_cache(past_key_values)
+
+    # Manual construction via the stable update() public API
     cache = DynamicCache()
-    for k_tensor, v_tensor in past_key_values:
-        cache.key_cache.append(k_tensor)
-        cache.value_cache.append(v_tensor)
+    for layer_idx, (k, v) in enumerate(past_key_values):
+        cache.update(k, v, layer_idx)
     return cache
 
 
 def clone_dynamic_cache(cache):
-    """Deep-clone a DynamicCache so each agent can mutate it independently.
+    """Deep-clone a DynamicCache so each agent gets its own mutable copy.
 
-    generate() appends new K/V entries to the cache in place.  Each agent
-    needs its own copy so agents don't corrupt each other's decoding state.
+    generate() extends the cache in-place per token; agents must not share
+    a live cache or they corrupt each other's decode state.
 
-    In a full AgentKV integration (Phase 3) this clone is replaced by a
-    CoW fork on the GPU — zero-copy until the first write.
+    In Phase 3's AgentKVCache this is replaced by a GPU CoW fork — zero-copy
+    until the first write — but copy.deepcopy() is correct here for any
+    transformers version regardless of internal attribute naming.
     """
-    from transformers import DynamicCache
-    new_cache = DynamicCache()
-    for k, v in zip(cache.key_cache, cache.value_cache):
-        new_cache.key_cache.append(k.clone())
-        new_cache.value_cache.append(v.clone())
-    return new_cache
+    return copy.deepcopy(cache)
 
 
 # ── Main demo ─────────────────────────────────────────────────────────────────
