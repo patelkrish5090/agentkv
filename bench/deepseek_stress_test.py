@@ -98,15 +98,37 @@ LONG_SYSTEM_PROMPT = (
 )
 
 AGENT_QUERIES = [
-    " What are the latest Phase III trials for GLP-1 receptor agonists in NASH?",
-    " Summarise the mechanism of action of KRAS G12C inhibitors and their resistance pathways.",
-    " Compare pembrolizumab and nivolumab efficacy in NSCLC with PD-L1 ≥50%.",
-    " What are the contraindications for SGLT2 inhibitors in CKD patients?",
-    " Explain the role of CAR-T cell therapy in relapsed/refractory DLBCL.",
-    " What biomarkers predict response to checkpoint inhibitors in melanoma?",
-    " Describe the pharmacokinetics of mRNA-LNP vaccines and their cold chain requirements.",
-    " What is the current standard of care for HER2-positive metastatic breast cancer?",
+    "What are the latest Phase III trials for GLP-1 receptor agonists in NASH?",
+    "Summarise the mechanism of action of KRAS G12C inhibitors and their resistance pathways.",
+    "Compare pembrolizumab and nivolumab efficacy in NSCLC with PD-L1 ≥50%.",
+    "What are the contraindications for SGLT2 inhibitors in CKD patients?",
+    "Explain the role of CAR-T cell therapy in relapsed/refractory DLBCL.",
+    "What biomarkers predict response to checkpoint inhibitors in melanoma?",
+    "Describe the pharmacokinetics of mRNA-LNP vaccines and their cold chain requirements.",
+    "What is the current standard of care for HER2-positive metastatic breast cancer?",
 ]
+
+
+def format_query_with_chat_template(tokenizer, system_prompt: str, user_query: str) -> str:
+    """Format a system+user message using the model's chat template.
+
+    Falls back to a plain [INST] format if no chat template is defined.
+    This is why the model generates coherent answers instead of repeating
+    the system prompt verbatim.
+    """
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": user_query},
+    ]
+    try:
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+    except Exception:
+        # Fallback: simple Llama-2 / Mistral style
+        return (
+            f"<s>[INST] <<SYS>>\n{system_prompt}\n<</SYS>>\n\n{user_query} [/INST]"
+        )
 
 
 def run_stress_test(
@@ -232,7 +254,7 @@ def run_stress_test(
     queries      = (AGENT_QUERIES * ((n_agents // len(AGENT_QUERIES)) + 1))[:n_agents]
     all_gen_ms   = []
     all_tok_counts = []
-    round_savings  = []
+    bytes_per_prompt_tok = kv_bytes / prompt_len   # KB per token in the prompt
 
     for rnd in range(n_rounds):
         print(f"\n   ── Round {rnd+1}/{n_rounds} ──")
@@ -241,22 +263,18 @@ def run_stress_test(
         round_toks   = []
 
         gen_device = "cuda" if device == "cuda" else device
-        prompt_ids = inputs.input_ids.to(gen_device)   # [1, prompt_len]
 
         for i, (agent, query) in enumerate(zip(agents, queries)):
-            # Encode the query (agent's unique question)
-            q_ids = tokenizer.encode(query, return_tensors="pt").to(gen_device)
+            # Format full system+user message using chat template → coherent answers
+            formatted = format_query_with_chat_template(tokenizer, prompt, query)
+            q_ids = tokenizer.encode(formatted, return_tensors="pt",
+                                     add_special_tokens=False).to(gen_device)
 
-            # KEY FIX: pass [prompt_ids | q_ids] as the full context to generate().
-            #
-            # Why: generate() with past_key_values internally trims input_ids to
-            #   input_ids[:, past_length:]
-            # If we only pass q_ids (shorter than past_length=106), the trimmed
-            # result is empty → crash "cannot reshape tensor of 0 elements".
-            # Passing full_ids (prompt + query) gives:
-            #   trimmed = full_ids[:, 106:] = q_ids  ← correct, non-empty
-            full_ids  = torch.cat([prompt_ids, q_ids], dim=1)     # [1, prompt_len + q_len]
-            full_mask = torch.ones_like(full_ids)                  # full causal mask
+            # For agents using chat templates, the full formatted prompt IS the
+            # complete input — no need to prepend prompt_ids separately.
+            # generate() receives the full chat-formatted sequence and handles caching.
+            full_ids  = q_ids
+            full_mask = torch.ones_like(full_ids)
 
             agent_cache = clone_cache(shared_cache)
 
@@ -290,16 +308,22 @@ def run_stress_test(
             print(f"     Agent {i+1} [{gen_ms:.0f}ms | {new_tok_count}tok | {tps:.0f}tok/s]: "
                   f"\"{gen_text[:70].replace(chr(10), ' ')}{'…' if len(gen_text)>70 else ''}\"")
 
-        # Pool stats for this round
+        # Pool stats + REAL savings for this round
         s = pool.stats()
-        naive_kv  = n_agents * kv_bytes
-        agentkv_kv = kv_bytes  # shared once
-        savings   = (1 - 1/n_agents) * 100
-        round_savings.append(savings)
+        avg_gen_toks   = sum(round_toks) / len(round_toks) if round_toks else 0
+        gen_kv_per_agent = avg_gen_toks * bytes_per_prompt_tok   # approx (same arch)
+
+        naive_kv_round    = n_agents * kv_bytes + n_agents * gen_kv_per_agent
+        agentkv_kv_round  = kv_bytes            + n_agents * gen_kv_per_agent
+        real_savings_pct  = (naive_kv_round - agentkv_kv_round) / naive_kv_round * 100
+        prompt_only_pct   = (1 - 1/n_agents) * 100
 
         print(f"\n     Round {rnd+1} pool stats: {s}")
-        print(f"     Prompt KV savings: {savings:.0f}%  "
-              f"(naive {naive_kv/1024:.0f} KB → AgentKV {agentkv_kv/1024:.0f} KB)")
+        print(f"     Prompt KV saved  : {(n_agents-1)*kv_bytes/1024:.0f} KB "
+              f"({prompt_only_pct:.0f}% of prompt KV, {n_agents}→1 copies)")
+        print(f"     Total KV savings : {real_savings_pct:.1f}%  "
+              f"(prompt {kv_bytes/1024:.0f} KB shared, "
+              f"gen {gen_kv_per_agent/1024:.0f} KB/agent unique)")
         print(f"     Avg latency: {sum(round_gen_ms)/len(round_gen_ms):.0f} ms/agent  |  "
               f"Avg throughput: {sum(round_toks)/sum(round_gen_ms)*1000:.0f} tok/s")
 
@@ -325,10 +349,22 @@ def run_stress_test(
     print(f"   ✅ Root freed. Pool fully recovered: {pool.free_blocks}/{pool_cfg.total_blocks}")
 
     # ── 6. Summary ────────────────────────────────────────────────────────────
-    total_ops   = n_rounds * n_agents
-    avg_lat_ms  = sum(all_gen_ms) / len(all_gen_ms)
-    avg_tps     = sum(all_tok_counts) / sum(all_gen_ms) * 1000
-    bytes_saved = (n_agents - 1) * kv_bytes * n_rounds   # vs naive N copies per round
+    total_ops       = n_rounds * n_agents
+    avg_lat_ms      = sum(all_gen_ms) / len(all_gen_ms)
+    avg_tps         = sum(all_tok_counts) / sum(all_gen_ms) * 1000
+    avg_gen_toks    = sum(all_tok_counts) / len(all_tok_counts)
+
+    # Real savings: account for both shared prompt KV and unique gen KV per agent
+    bytes_per_tok   = kv_bytes / prompt_len
+    gen_kv_per_agent = avg_gen_toks * bytes_per_tok
+
+    naive_per_round    = n_agents * kv_bytes + n_agents * gen_kv_per_agent
+    agentkv_per_round  = kv_bytes + n_agents * gen_kv_per_agent
+    total_real_savings = (naive_per_round - agentkv_per_round) / naive_per_round * 100
+    prompt_only_pct    = (1 - 1/n_agents) * 100
+
+    # Total prompt KV bytes saved across all rounds
+    prompt_kv_saved_total = (n_agents - 1) * kv_bytes * n_rounds
 
     print(f"\n[6/6] Summary\n{'='*65}")
     print(f"  Model          : {model_name}")
@@ -341,10 +377,20 @@ def run_stress_test(
     print(f"  p50 latency    : {sorted(all_gen_ms)[len(all_gen_ms)//2]:.0f} ms")
     print(f"  p90 latency    : {sorted(all_gen_ms)[int(len(all_gen_ms)*0.9)]:.0f} ms")
     print()
-    print(f"  Naive KV (per round)  : {n_agents * kv_bytes / 1024:.1f} KB")
-    print(f"  AgentKV KV (per round): {kv_bytes / 1024:.1f} KB  (shared once)")
-    print(f"  Prompt KV saved total : {bytes_saved / 1024:.1f} KB across {n_rounds} rounds")
-    print(f"  Savings %             : {(1 - 1/n_agents)*100:.0f}% of prompt KV per round")
+    print(f"  ── KV Memory Analysis ──")
+    print(f"  Prompt KV/round (naive)  : {n_agents * kv_bytes / 1024:.1f} KB  "
+          f"({n_agents} agent copies)")
+    print(f"  Prompt KV/round (AgentKV): {kv_bytes / 1024:.1f} KB  "
+          f"(1 shared copy, CoW)")
+    print(f"  Gen KV/agent (unique)    : {gen_kv_per_agent / 1024:.1f} KB  "
+          f"(avg {avg_gen_toks:.0f} new tokens, not shared)")
+    print()
+    print(f"  Prompt-only savings  : {prompt_only_pct:.0f}%  "
+          f"(saved {(n_agents-1)*kv_bytes/1024:.0f} KB/round)")
+    print(f"  TOTAL savings        : {total_real_savings:.1f}%  "
+          f"(prompt shared, gen unique — real number)")
+    print(f"  Prompt KV saved total: {prompt_kv_saved_total/1024:.1f} KB "
+          f"across {n_rounds} rounds")
 
     if device == "cuda":
         torch.cuda.synchronize()
