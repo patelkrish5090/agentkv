@@ -3,111 +3,100 @@ bench/hf_model_demo.py — AgentKV + HuggingFace model integration demo.
 
 What this demonstrates
 ----------------------
-1. Run a real HuggingFace model (GPT-2 or TinyLlama) for inference.
+1. Run a real HuggingFace model (GPT-2) for inference.
 2. Compute the KV cache for a shared prompt prefix ONCE.
-3. Fork 4 agents from the same root — they SHARE the prompt KV cache.
+3. Fork 4 agents from the same root — they SHARE the prompt KV via AgentKV CoW.
 4. Each agent independently continues from the shared KV prefix (real text).
 5. Measure actual GPU memory: AgentKV CoW vs naive copy-per-agent.
 
 Architecture note (honest)
 --------------------------
 In v1, AgentKV acts as a memory *tracker* alongside HuggingFace inference.
-The actual KV tensors are still in HuggingFace's DynamicCache format.
+The actual KV tensors live in HuggingFace's DynamicCache format.
 AgentKV tracks WHICH blocks are shared and WHAT the theoretical savings are.
 
 Phase 3 will implement a true custom HF Cache subclass (AgentKVCache) so
-AgentKV's pool IS the storage — no HF copy at all.  This demo is the
-stepping stone that proves the concept with real model outputs.
+AgentKV's slab pool IS the storage — no HF copy overhead at all.
 
-HF's past_key_values sharing
------------------------------
-When you call model.generate(new_tokens, past_key_values=shared_kv), HF:
-  - Does NOT copy shared_kv in place
-  - Appends new K/V tensors to a fresh DynamicCache for each call
-  - So 4 agents sharing the same past_key_values is safe and correct
+HF past_key_values API changes
+-------------------------------
+transformers < 4.38  : model() returns tuple of (K,V) tuples; generate() accepts tuples.
+transformers 4.38-4.40: model() returns DynamicCache OR tuple depending on model.
+transformers >= 4.41 : generate() HARD-REJECTS tuples — must be a Cache instance.
+
+Fix: call to_dynamic_cache() right after model() to normalise before any generate() call.
 
 Usage
 -----
-  # CPU mode (slow but works anywhere):
-  python bench/hf_model_demo.py --device cpu --model gpt2
-
-  # T4 Colab (fast):
   python bench/hf_model_demo.py --device cuda --model gpt2
-
-  # Larger model (needs more VRAM):
   python bench/hf_model_demo.py --device cuda --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
 """
 
 from __future__ import annotations
 
 import argparse
-import gc
 import time
-from typing import List, Optional, Tuple
 
 import torch
 
 
-def bytes_of_past_kv(past_key_values) -> int:
-    """Return total byte size of a HuggingFace past_key_values cache.
+# ── HF Cache helpers ──────────────────────────────────────────────────────────
 
-    Handles both formats:
-      - Old (transformers < 4.38): tuple of (key, value) tensors per layer
-      - New (transformers >= 4.38): DynamicCache object with .key_cache / .value_cache
-    """
+def bytes_of_cache(cache) -> int:
+    """Return the total byte size of a HF DynamicCache or legacy tuple cache."""
     total = 0
-    # New-style: DynamicCache has .key_cache and .value_cache lists
-    if hasattr(past_key_values, 'key_cache'):
-        for t in past_key_values.key_cache:
+    if hasattr(cache, "key_cache"):          # DynamicCache
+        for t in cache.key_cache:
             if t is not None:
                 total += t.numel() * t.element_size()
-        for t in past_key_values.value_cache:
+        for t in cache.value_cache:
             if t is not None:
                 total += t.numel() * t.element_size()
-    else:
-        # Old-style: tuple of (key_tensor, value_tensor) per layer
-        for layer_kv in past_key_values:
-            for tensor in layer_kv:
-                if tensor is not None:
-                    total += tensor.numel() * tensor.element_size()
+    else:                                     # legacy tuple-of-tuples
+        for layer_kv in cache:
+            for t in layer_kv:
+                if t is not None:
+                    total += t.numel() * t.element_size()
     return total
 
 
-def clone_past_kv(past_key_values):
-    """Deep clone the HF KV cache so each agent can safely mutate it during generate().
-    
-    (AgentKV solves this naturally via CoW without cloning, but since we are 
-    using standard HF generate() here to simulate the outputs, we must clone).
+def to_dynamic_cache(past_key_values):
+    """Convert any past_key_values format to DynamicCache.
+
+    MUST be called right after model() forward — before any generate() call.
+    transformers >= 4.41 rejects tuples inside generate(); we normalise here.
     """
-    try:
-        from transformers import DynamicCache
-        
-        # If it's a new-style DynamicCache
-        if hasattr(past_key_values, 'key_cache'):
-            new_cache = DynamicCache()
-            for k, v in zip(past_key_values.key_cache, past_key_values.value_cache):
-                new_cache.key_cache.append(k.clone() if k is not None else None)
-                new_cache.value_cache.append(v.clone() if v is not None else None)
-            return new_cache
-            
-        # If it's an old-style tuple, but we have DynamicCache available, 
-        # convert it to DynamicCache since generate() requires it now.
-        elif isinstance(past_key_values, tuple):
-            new_cache = DynamicCache()
-            for layer in past_key_values:
-                new_cache.key_cache.append(layer[0].clone() if layer[0] is not None else None)
-                new_cache.value_cache.append(layer[1].clone() if layer[1] is not None else None)
-            return new_cache
-            
-    except ImportError:
-        pass
+    from transformers import DynamicCache
 
-    # Fallback for old transformers (< 4.38)
-    return tuple(
-        tuple(t.clone() if t is not None else None for t in layer)
-        for layer in past_key_values
-    )
+    if isinstance(past_key_values, DynamicCache):
+        return past_key_values                # Already the right type
 
+    # Legacy tuple-of-tuples: ((K0, V0), (K1, V1), ...)
+    cache = DynamicCache()
+    for k_tensor, v_tensor in past_key_values:
+        cache.key_cache.append(k_tensor)
+        cache.value_cache.append(v_tensor)
+    return cache
+
+
+def clone_dynamic_cache(cache):
+    """Deep-clone a DynamicCache so each agent can mutate it independently.
+
+    generate() appends new K/V entries to the cache in place.  Each agent
+    needs its own copy so agents don't corrupt each other's decoding state.
+
+    In a full AgentKV integration (Phase 3) this clone is replaced by a
+    CoW fork on the GPU — zero-copy until the first write.
+    """
+    from transformers import DynamicCache
+    new_cache = DynamicCache()
+    for k, v in zip(cache.key_cache, cache.value_cache):
+        new_cache.key_cache.append(k.clone())
+        new_cache.value_cache.append(v.clone())
+    return new_cache
+
+
+# ── Main demo ─────────────────────────────────────────────────────────────────
 
 def run_demo(
     model_name: str = "gpt2",
@@ -115,8 +104,8 @@ def run_demo(
     shared_prompt: str = "Scientists discovered that artificial intelligence systems",
     n_agents: int = 4,
     new_tokens_per_agent: int = 20,
-) -> None:
-    # ── 1. Load model ─────────────────────────────────────────────────────────
+) -> dict:
+
     print(f"\n{'='*60}")
     print(f"AgentKV + HuggingFace Demo")
     print(f"  model  = {model_name}")
@@ -124,12 +113,11 @@ def run_demo(
     print(f"  agents = {n_agents}")
     print(f"{'='*60}\n")
 
+    # ── 1. Load model ─────────────────────────────────────────────────────────
     try:
         from transformers import AutoTokenizer, AutoModelForCausalLM
     except ImportError:
-        raise ImportError(
-            "transformers not installed. Run: pip install transformers accelerate"
-        )
+        raise ImportError("pip install transformers accelerate")
 
     print(f"[1/5] Loading {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -139,53 +127,50 @@ def run_demo(
     torch_dtype = torch.float16 if device == "cuda" else torch.float32
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        dtype=torch_dtype,
+        torch_dtype=torch_dtype,
         low_cpu_mem_usage=True,
     ).to(device).eval()
 
-    cfg = model.config
-    n_layers = cfg.num_hidden_layers
-    # HF models vary in how they name KV head count
-    n_kv_heads = getattr(cfg, "num_key_value_heads",
-                  getattr(cfg, "num_attention_heads", 8))
-    head_dim = getattr(cfg, "head_dim",
-                cfg.hidden_size // cfg.num_attention_heads)
+    mcfg = model.config
+    n_layers   = mcfg.num_hidden_layers
+    n_kv_heads = getattr(mcfg, "num_key_value_heads",
+                  getattr(mcfg, "num_attention_heads", 8))
+    head_dim   = getattr(mcfg, "head_dim",
+                  mcfg.hidden_size // mcfg.num_attention_heads)
 
-    print(f"   Model loaded: {n_layers} layers, {n_kv_heads} KV heads, head_dim={head_dim}")
+    print(f"   {n_layers} layers | {n_kv_heads} KV heads | head_dim={head_dim}")
     if device == "cuda":
-        used_gb = torch.cuda.memory_allocated() / 1e9
-        free_gb = torch.cuda.mem_get_info()[0] / 1e9
-        print(f"   Model VRAM: {used_gb:.2f} GB used, {free_gb:.2f} GB free")
+        print(f"   VRAM: {torch.cuda.memory_allocated()/1e9:.2f} GB used, "
+              f"{torch.cuda.mem_get_info()[0]/1e9:.2f} GB free")
 
-    # ── 2. Compute shared prefix KV cache ────────────────────────────────────
-    print(f"\n[2/5] Computing shared prefix KV cache for prompt...")
-    print(f"   Prompt: \"{shared_prompt}\"")
+    # ── 2. Prefill shared prompt → get KV cache ───────────────────────────────
+    print(f"\n[2/5] Prefilling shared prompt...")
+    print(f"   \"{shared_prompt}\"")
 
-    inputs = tokenizer(shared_prompt, return_tensors="pt").to(device)
+    inputs     = tokenizer(shared_prompt, return_tensors="pt").to(device)
     prompt_len = inputs.input_ids.shape[1]
-    print(f"   Prompt length: {prompt_len} tokens")
+    print(f"   {prompt_len} tokens")
 
     t0 = time.perf_counter()
     with torch.no_grad():
         prefix_out = model(**inputs, use_cache=True)
     prefill_ms = (time.perf_counter() - t0) * 1000
 
-    shared_past_kv = prefix_out.past_key_values
-    kv_bytes = bytes_of_past_kv(shared_past_kv)
+    # Normalise to DynamicCache IMMEDIATELY — this is the key fix.
+    # GPT-2's model() returns a legacy tuple; generate() >= 4.41 rejects tuples.
+    shared_cache = to_dynamic_cache(prefix_out.past_key_values)
+    kv_bytes     = bytes_of_cache(shared_cache)
 
-    print(f"   KV cache size: {kv_bytes / 1024:.1f} KB "
-          f"({kv_bytes / 1024 / prompt_len:.1f} KB/token)")
-    print(f"   Prefill time: {prefill_ms:.1f} ms")
+    print(f"   KV cache: {kv_bytes/1024:.1f} KB  |  prefill: {prefill_ms:.0f} ms")
 
-    # ── 3. Set up AgentKV pool ────────────────────────────────────────────────
-    print(f"\n[3/5] Initialising AgentKV pool (matching model architecture)...")
+    # ── 3. AgentKV pool (sized to model architecture) ─────────────────────────
+    print(f"\n[3/5] Initialising AgentKV pool...")
 
     from agentkv import AgentKVPool
     from agentkv.core.config import PoolConfig
 
-    # Size pool to fit in available VRAM (50% of free → safe margin)
     if device == "cuda":
-        cfg_pool = PoolConfig.max_for_device(
+        pool_cfg = PoolConfig.max_for_device(
             fraction=0.5,
             num_layers=n_layers,
             num_kv_heads=n_kv_heads,
@@ -195,7 +180,7 @@ def run_demo(
             device=device,
         )
     else:
-        cfg_pool = PoolConfig(
+        pool_cfg = PoolConfig(
             total_blocks=512,
             num_layers=n_layers,
             num_kv_heads=n_kv_heads,
@@ -205,114 +190,109 @@ def run_demo(
             device=device,
         )
 
-    pool = AgentKVPool(config=cfg_pool)
-    print(f"   Pool: {cfg_pool}")
-
-    # Register shared prompt as root agent
-    root = pool.create_root(inputs.input_ids[0].tolist())
-    n_prompt_blocks = max(1, (prompt_len + cfg_pool.block_size - 1) // cfg_pool.block_size)
+    pool            = AgentKVPool(config=pool_cfg)
+    root            = pool.create_root(inputs.input_ids[0].tolist())
+    n_prompt_blocks = max(1, (prompt_len + pool_cfg.block_size - 1) // pool_cfg.block_size)
     for _ in range(n_prompt_blocks):
         pool.allocate_block(root)
-    print(f"   Root agent: {n_prompt_blocks} blocks for {prompt_len} prompt tokens")
 
-    # ── 4. Fork agents and generate ──────────────────────────────────────────
-    print(f"\n[4/5] Forking {n_agents} agents and generating continuations...")
+    print(f"   {pool_cfg}")
+    print(f"   Root: {n_prompt_blocks} block(s) for {prompt_len} prompt tokens")
 
-    agent_continuations = [
+    # ── 4. Fork agents and run generation ────────────────────────────────────
+    print(f"\n[4/5] Forking {n_agents} agents + generating...")
+
+    continuations = [
         " can solve problems that seemed impossible before",
         " still struggles with common-sense reasoning",
         " is transforming how doctors diagnose diseases",
         " needs strict regulation to prevent misuse",
+        " will reshape education in fundamental ways",
+        " creates new opportunities in every industry",
+        " raises deep questions about human creativity",
+        " depends on the quality of training data",
     ][:n_agents]
-
-    # Pad to n_agents if fewer continuations defined
-    while len(agent_continuations) < n_agents:
-        agent_continuations.append(f" opens new research directions")
+    while len(continuations) < n_agents:
+        continuations.append(" opens many new research directions")
 
     agents = [pool.fork(root) for _ in range(n_agents)]
-    print(f"   Forked {n_agents} agents (all sharing {n_prompt_blocks} prompt blocks)")
+    print(f"   {n_agents} agents forked — all share {n_prompt_blocks} prompt block(s)")
 
-    results = []
-    agent_gen_times = []
-    child_new_token_counts = []
+    results              = []
+    child_new_tok_counts = []
 
-    for i, (agent, continuation) in enumerate(zip(agents, agent_continuations)):
-        # Tokenize the continuation (new tokens each agent sees)
-        cont_ids = tokenizer.encode(continuation, return_tensors="pt").to(device)
+    for i, (agent, cont) in enumerate(zip(agents, continuations)):
+        cont_ids = tokenizer.encode(cont, return_tensors="pt").to(device)
 
+        # Clone the shared DynamicCache for this agent.
+        # generate() appends new KVs in place, so each agent needs its own copy.
+        # (In Phase 3's AgentKVCache this becomes a zero-copy GPU CoW fork.)
         t0 = time.perf_counter()
-        agent_past_kv = clone_past_kv(shared_past_kv)
+        agent_cache = clone_dynamic_cache(shared_cache)
+
         with torch.no_grad():
             gen_ids = model.generate(
                 cont_ids,
-                past_key_values=agent_past_kv,  # Give each agent its own copy to mutate
+                past_key_values=agent_cache,   # DynamicCache — always accepted
                 max_new_tokens=new_tokens_per_agent,
                 do_sample=False,
                 pad_token_id=tokenizer.eos_token_id,
                 use_cache=True,
             )
         gen_ms = (time.perf_counter() - t0) * 1000
-        agent_gen_times.append(gen_ms)
 
-        # Decode: full output = prompt + continuation + generated
-        full_text = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
-        results.append((continuation.strip(), full_text))
-
-        # Track new tokens in AgentKV
+        full_text    = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
         new_tok_count = gen_ids.shape[1] - cont_ids.shape[1]
-        child_new_token_counts.append(new_tok_count)
-        n_new_blocks = max(1, (new_tok_count + cfg_pool.block_size - 1) // cfg_pool.block_size)
+        results.append((cont.strip(), full_text))
+        child_new_tok_counts.append(new_tok_count)
+
+        # Track new blocks in AgentKV
+        n_new_blocks = max(1, (new_tok_count + pool_cfg.block_size - 1) // pool_cfg.block_size)
         for _ in range(n_new_blocks):
             pool.allocate_block(agent)
 
-        print(f"   Agent {i+1} [{gen_ms:.0f}ms, {new_tok_count} new tokens]: "
-              f"\"{continuation.strip()[:40]}...\"")
+        print(f"   Agent {i+1} [{gen_ms:.0f} ms | {new_tok_count} new tokens]: "
+              f"\"{cont.strip()[:45]}...\"")
 
     # ── 5. Results ────────────────────────────────────────────────────────────
-    print(f"\n[5/5] Results\n{'='*60}")
+    print(f"\n[5/5] Generated text\n{'='*60}")
     print(f"\nShared prefix: \"{shared_prompt}\"\n")
-    for i, (cont, full) in enumerate(results):
-        # Show only the generated portion (after the continuation)
+    for i, (cont, text) in enumerate(results):
         print(f"Agent {i+1}  (+\"{cont}\")")
-        print(f"        → {shared_prompt}{full[:120]}")
+        # Show the full generated output (trimmed to 150 chars)
+        display = f"{shared_prompt}{text}"
+        print(f"        → {display[:150]}{'…' if len(display)>150 else ''}")
         print()
 
-    # Memory analysis
+    # ── Memory analysis ───────────────────────────────────────────────────────
     print(f"{'='*60}")
     print("Memory Analysis")
     print(f"{'='*60}")
 
-    avg_child_tokens = sum(child_new_token_counts) / n_agents if child_new_token_counts else 0
-    bytes_per_token = kv_bytes / prompt_len
+    bytes_per_tok = kv_bytes / prompt_len
+    child_kv_bytes = sum(t * bytes_per_tok for t in child_new_tok_counts)
 
-    # Naive: each agent gets its own copy of the shared prompt KV
-    naive_total_bytes = n_agents * kv_bytes + sum(
-        t * bytes_per_token for t in child_new_token_counts
-    )
-    # AgentKV: shared prompt KV + each agent's own new tokens only
-    agentkv_total_bytes = kv_bytes + sum(
-        t * bytes_per_token for t in child_new_token_counts
-    )
-    savings_pct = (1 - agentkv_total_bytes / naive_total_bytes) * 100
+    naive_total    = n_agents * kv_bytes + child_kv_bytes   # each agent copies prompt KV
+    agentkv_total  = kv_bytes           + child_kv_bytes   # prompt KV shared once
 
-    print(f"  Model:              {model_name}")
-    print(f"  Shared prompt:      {prompt_len} tokens = {kv_bytes/1024:.1f} KB KV cache")
-    print(f"  Agents:             {n_agents}")
-    print(f"  Avg new tokens:     {avg_child_tokens:.0f} per agent")
+    savings_pct = (1 - agentkv_total / naive_total) * 100
+
+    print(f"  Model           : {model_name}")
+    print(f"  Shared prompt   : {prompt_len} tokens → {kv_bytes/1024:.1f} KB KV cache")
+    print(f"  Agents          : {n_agents}")
+    print(f"  Avg new tokens  : {sum(child_new_tok_counts)/n_agents:.0f}")
     print()
-    print(f"  Naive KV memory:    {naive_total_bytes/1024:.1f} KB")
-    print(f"    = {n_agents} copies of prompt KV + child-specific KV")
-    print(f"  AgentKV memory:     {agentkv_total_bytes/1024:.1f} KB")
-    print(f"    = 1 shared prompt KV + child-specific KV only")
-    print(f"  Memory saved:       {(naive_total_bytes - agentkv_total_bytes)/1024:.1f} KB "
-          f"({savings_pct:.1f}%)")
+    print(f"  Naive KV memory : {naive_total/1024:.1f} KB")
+    print(f"    ({n_agents}× prompt copy + per-agent new tokens)")
+    print(f"  AgentKV memory  : {agentkv_total/1024:.1f} KB")
+    print(f"    (1× shared prompt + per-agent new tokens)")
+    print(f"  Saved           : {(naive_total-agentkv_total)/1024:.1f} KB  ({savings_pct:.1f}%)")
     print()
-    print(f"  AgentKV pool stats: {pool.stats()}")
+    print(f"  AgentKV stats   : {pool.stats()}")
 
     if device == "cuda":
         torch.cuda.synchronize()
-        final_used_gb = torch.cuda.memory_allocated() / 1e9
-        print(f"\n  Final GPU VRAM used: {final_used_gb:.2f} GB")
+        print(f"  Final VRAM used : {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
     # Cleanup
     for agent in agents:
@@ -326,22 +306,21 @@ def run_demo(
         "prompt_len": prompt_len,
         "kv_bytes": kv_bytes,
         "n_agents": n_agents,
-        "naive_bytes": naive_total_bytes,
-        "agentkv_bytes": agentkv_total_bytes,
+        "naive_bytes": naive_total,
+        "agentkv_bytes": agentkv_total,
         "savings_pct": savings_pct,
         "results": results,
     }
 
 
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AgentKV + HuggingFace Model Demo")
-    parser.add_argument("--model", default="gpt2",
-                        help="HuggingFace model name (default: gpt2)")
+    parser.add_argument("--model",  default="gpt2")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--prompt",
-                        default="Scientists discovered that artificial intelligence systems",
-                        help="Shared prompt prefix for all agents")
-    parser.add_argument("--n-agents", type=int, default=4)
+    parser.add_argument("--prompt", default="Scientists discovered that artificial intelligence systems")
+    parser.add_argument("--n-agents",   type=int, default=4)
     parser.add_argument("--new-tokens", type=int, default=20)
     args = parser.parse_args()
 
