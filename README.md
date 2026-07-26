@@ -153,7 +153,7 @@ and `bench/branching_benchmark.py` for a larger branching scenario.
 | **Phase 2** | Python bindings + `AgentKVPool` API | ✅ Complete |
 | **Phase 3** | HuggingFace + vLLM + SGLang integrations | ✅ Complete (unit-tested; see caveat below) |
 | **Phase 4** | Cooperative scheduling (research preview) | ⏳ Research preview |
-| **Benchmarks** | ToT branching benchmark suite | 🔄 Scripts exist (`bench/`); no numbers published — see [Performance Claims](#performance-claims) |
+| **Benchmarks** | ToT branching benchmark suite | 🔄 One real measured result on a T4 (see [Performance Claims](#performance-claims)); broader sweep (longer prompts, naive baseline) still pending |
 
 **What "Phase 3 complete" means here, precisely:** all three integrations
 (`agentkv/hf_cache.py`, `integrations/vllm/`, `integrations/sglang/`) are
@@ -190,7 +190,15 @@ pytest tests/test_stress.py -v --timeout=300
 
 ## Performance Claims
 
-> **⚠️ No benchmark numbers are presented here.** Performance claims will only appear in this README once a corresponding benchmark script in `bench/` has been committed and results have been reproduced on documented hardware. See `docs/BENCHMARKS.md` (coming in Phase 3+) for the honest record.
+One real, reproducible result so far: forking 4 agents from a shared prefix
+on a real DeepSeek-R1-Distill-Llama-8B (4-bit) model on a T4 GPU cost a
+measured **+0.000 GB** (`torch.cuda.memory_allocated()`, not computed) —
+confirming the CoW fork mechanism works on real hardware. See
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the full setup and numbers,
+and its own caveats (short prompt so far, no naive-baseline comparison yet).
+No throughput or memory-ceiling claims are made beyond what's in that file —
+anything not backed by a committed, reproduced benchmark script isn't
+claimed here.
 
 ---
 
