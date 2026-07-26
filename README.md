@@ -190,15 +190,22 @@ pytest tests/test_stress.py -v --timeout=300
 
 ## Performance Claims
 
-One real, reproducible result so far: forking 4 agents from a shared prefix
-on a real DeepSeek-R1-Distill-Llama-8B (4-bit) model on a T4 GPU cost a
-measured **+0.000 GB** (`torch.cuda.memory_allocated()`, not computed) —
-confirming the CoW fork mechanism works on real hardware. See
-[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the full setup and numbers,
-and its own caveats (short prompt so far, no naive-baseline comparison yet).
-No throughput or memory-ceiling claims are made beyond what's in that file —
-anything not backed by a committed, reproduced benchmark script isn't
-claimed here.
+Real, reproducible results against a real naive baseline, on a real DeepSeek-R1-Distill-Llama-8B
+(4-bit) model on a T4 GPU, 8 agents forked from an 879-token shared prompt
+(`torch.cuda.memory_allocated()`, measured not computed):
+
+- **Cost of forking 8 agents:** naive `copy.deepcopy()` +0.922 GB vs. AgentKV
+  `fork()` **+0.000 GB** — 100% of the fork-time memory cost eliminated.
+- **Total growth, prefill through generation:** naive +1.071 GB vs. AgentKV
+  +0.270 GB — a 74.8% reduction.
+
+See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the full setup, the
+stage-by-stage numbers, and an important caveat about reading AgentKV's raw
+`memory_allocated()` totals in isolation (a fixed pool pre-allocation makes
+them look larger than naive's at a glance — the delta numbers above are the
+honest comparison). No throughput or memory-ceiling claims are made beyond
+what's in that file — anything not backed by a committed, reproduced
+benchmark script isn't claimed here.
 
 ---
 

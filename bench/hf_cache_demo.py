@@ -343,6 +343,11 @@ def run_naive(model, tokenizer, args, prompt: str, on_gpu: bool) -> dict:
         prefix_out = model(**inputs, use_cache=True)
     prefill_ms = (time.perf_counter() - t0) * 1000
     shared_cache = to_dynamic_cache(prefix_out.past_key_values)
+    # The forward pass's logits tensor (seq_len x vocab_size, can be a few
+    # hundred MB on its own) has no reason to stay alive once we've pulled
+    # past_key_values out of it - drop the reference so the "after prefill"
+    # measurement reflects only the KV cache, not this incidental output.
+    del prefix_out
     stages["after prefill"] = gpu_mem_gb(on_gpu)
     print(f"   {prompt_len} tokens | prefill: {prefill_ms:.0f} ms")
 
