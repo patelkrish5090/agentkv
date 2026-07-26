@@ -1,7 +1,10 @@
 # AgentKV
 
 > **⚠️ Status: Early Development (Pre-Alpha) — not production ready.**
-> APIs will change without notice. Phase 0 (scaffolding) is complete; Phase 1 (core allocator) is in progress.
+> APIs will change without notice. Phases 0–3 (core allocator, Python API,
+> HuggingFace/vLLM/SGLang integrations) are implemented and covered by tests;
+> see [Development Status](#development-status) for exactly what that does
+> and doesn't mean yet.
 
 ---
 
@@ -100,36 +103,44 @@ pip install -e ".[dev]"
 
 ---
 
-## Quickstart (Phase 2 — not yet implemented)
+## Quickstart
 
 ```python
 from agentkv import AgentKVPool
+from agentkv.core.config import PoolConfig
 
-# Allocate a 40 GB pool with 16-token KV blocks
-pool = AgentKVPool(capacity_gb=40, block_size=16)
+# A small, deterministic pool for a CPU-only smoke test.
+# On a real GPU, use AgentKVPool(capacity_gb=..., device="cuda") instead.
+pool = AgentKVPool(config=PoolConfig(
+    total_blocks=64, block_size=16,
+    num_layers=2, num_kv_heads=4, head_dim=64, device="cpu",
+))
 
 # Load a prompt into the root handle
-root = pool.create_root(prompt_tokens=[1, 2, 3, ...])
+root = pool.create_root(prompt_tokens=list(range(32)))
+pool.allocate_block(root)  # one block per block_size tokens generated
 
 # Fork to create child agents — they SHARE the parent's KV blocks
 child_a = pool.fork(root)
 child_b = pool.fork(root)
 child_c = pool.fork(root)
 
-# Each child allocates its own new blocks for divergent tokens
-pool.allocate_block(child_a, n_tokens=16)
+# Each child allocates its own new block for divergent tokens
+pool.allocate_block(child_a)
 
 # Free when done — ref counting ensures shared blocks aren't freed early
 pool.free(child_a)
 pool.free(child_b)
 pool.free(child_c)
 pool.free(root)
+pool.maybe_advance_epoch()  # reclaim freed blocks immediately (normally automatic)
 
-print(pool.stats())
-# → {'total_blocks': 512, 'allocated': 4, 'shared_savings_blocks': 6, ...}
+print(pool)
+# → AgentKVPool(total=64, free=64, allocated=0, agents=0, pool=0.00 GiB)
 ```
 
-> **⚠️ The above API is planned but not yet implemented.** Phase 0 (scaffolding) is the current milestone.
+This example runs as-is — see `tests/test_api.py` for the full API surface
+and `bench/branching_benchmark.py` for a larger branching scenario.
 
 ---
 
@@ -138,11 +149,27 @@ print(pool.stats())
 | Phase | Description | Status |
 |---|---|---|
 | **Phase 0** | Repo scaffolding, CI, packaging | ✅ Complete |
-| **Phase 1** | CoW Radix Tree allocator + Triton kernels | 🔄 In Progress |
-| **Phase 2** | Python bindings + `AgentKVPool` API | ⏳ Planned |
-| **Phase 3** | vLLM + SGLang integrations | ⏳ Planned |
+| **Phase 1** | CoW Radix Tree allocator + Triton kernels | ✅ Complete |
+| **Phase 2** | Python bindings + `AgentKVPool` API | ✅ Complete |
+| **Phase 3** | HuggingFace + vLLM + SGLang integrations | ✅ Complete (unit-tested; see caveat below) |
 | **Phase 4** | Cooperative scheduling (research preview) | ⏳ Research preview |
-| **Benchmarks** | ToT branching benchmark suite | ⏳ Planned |
+| **Benchmarks** | ToT branching benchmark suite | 🔄 Scripts exist (`bench/`); no numbers published — see [Performance Claims](#performance-claims) |
+
+**What "Phase 3 complete" means here, precisely:** all three integrations
+(`agentkv/hf_cache.py`, `integrations/vllm/`, `integrations/sglang/`) are
+implemented and exercised by passing tests (86 total, `pytest tests/ -v -m
+"not gpu"`). The HuggingFace integration has additionally been run against
+real models (see `bench/hf_model_demo.py`, `bench/deepseek_stress_test.py`).
+The vLLM and SGLang integrations have **not** been run against real vLLM or
+SGLang installs — neither is installable in this dev environment (both
+need Triton + a CUDA build; Triton doesn't run on native Windows) — so they
+are validated against local stubs of each framework's interfaces, built
+from vendored/fetched reference source, in `tests/fakes/`. Each
+integration's own README documents this and any other known limitations
+(notably: AgentKV's shared-prefix sharing is bounded by concurrently-alive
+requests, not a time-persistent cache — see
+[`integrations/vllm/README.md`](integrations/vllm/README.md) and
+[`integrations/sglang/README.md`](integrations/sglang/README.md)).
 
 ---
 

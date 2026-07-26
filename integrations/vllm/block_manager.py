@@ -105,11 +105,15 @@ class AgentKVBlockManager(BlockSpaceManager):
             self.pool.allocate_block(handle)
             current_blocks += 1
             
-        # Optional: we can commit the prompt to the shared tree immediately 
+        # Optional: we can commit the prompt to the shared tree immediately
         # so future requests share it. We commit up to the last full block.
+        # commit_prefix() takes the length of *new* tokens to promote beyond
+        # whatever prefix this handle already matched — not the absolute
+        # prompt length — so we must subtract shared_match_len first.
         safe_share_len = (len(token_ids) // self.block_size) * self.block_size
-        if safe_share_len > 0:
-            self.pool.commit_prefix(handle, safe_share_len)
+        residual_share_len = safe_share_len - handle.shared_match_len
+        if residual_share_len > 0:
+            self.pool.commit_prefix(handle, residual_share_len)
 
         # Fork for speculative decoding or beam search
         for child_seq in waiting_seqs[1:]:
@@ -172,7 +176,7 @@ class AgentKVBlockManager(BlockSpaceManager):
         return self.pool.get_block_ids(handle)
 
     def get_num_free_gpu_blocks(self) -> int:
-        return self.pool._allocator.free_blocks
+        return self.pool.free_blocks
 
     def get_num_free_cpu_blocks(self) -> int:
         return self.num_cpu_blocks  # CPU block swapping not supported in AgentKV demo
