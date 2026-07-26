@@ -128,18 +128,25 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    load_kwargs: dict = {"trust_remote_code": True, "low_cpu_mem_usage": True}
+    # AgentKVCache's slab pool is always float16 (see PoolConfig below), so the
+    # model's own compute dtype must also be float16 everywhere - not just the
+    # bnb_4bit_compute_dtype (which only governs the 4-bit dequant matmul).
+    # Without this, transformers loads the model at its checkpoint's native
+    # dtype (often bfloat16 for Llama-family models), and the query tensor
+    # computed by the model's own attention layer ends up bfloat16 while
+    # AgentKVCache hands back float16 key/value tensors - scaled_dot_product_
+    # attention then rejects the dtype mismatch.
+    compute_dtype = torch.float16 if on_gpu else torch.float32
+    load_kwargs: dict = {"trust_remote_code": True, "low_cpu_mem_usage": True, "dtype": compute_dtype}
     if args.load_in_4bit:
         from transformers import BitsAndBytesConfig
         load_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_compute_dtype=compute_dtype,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
         )
         load_kwargs["device_map"] = "auto"
-    else:
-        load_kwargs["torch_dtype"] = torch.float16 if on_gpu else torch.float32
 
     model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
     if not args.load_in_4bit:
