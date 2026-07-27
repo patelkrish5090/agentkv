@@ -127,7 +127,20 @@ def parse_args():
                               "where weights alone need real headroom before any KV blocks fit.")
     parser.add_argument("--quantization", type=str, default=None,
                          help="'bitsandbytes' for real in-flight 4-bit NF4 quantization of a plain "
-                              "fp16/bf16 checkpoint (confirmed present in vLLM v0.5.4)")
+                              "fp16/bf16 checkpoint (confirmed present in vLLM v0.5.4). Loading with "
+                              "this on an 8B model genuinely takes ~10+ minutes with no progress "
+                              "output during the BitsAndBytes weight-loading step - that's normal, "
+                              "not a hang; vLLM's own log says this path 'is not fully optimized "
+                              "yet'. 'awq'/'gptq' are faster alternatives if you have a pre-quantized "
+                              "checkpoint already.")
+    parser.add_argument("--max-model-len", type=int, default=None,
+                         help="Cap the engine's max sequence length - some checkpoints (e.g. "
+                              "DeepSeek-R1-Distill-Llama-8B, inherited from Llama 3.1's 128K context) "
+                              "default to a max_model_len vLLM then insists the reserved KV cache must "
+                              "be able to hold in full for at least one sequence, causing a startup "
+                              "ValueError ('max seq len is larger than the maximum number of tokens "
+                              "that can be stored in KV cache') at low --gpu-memory-utilization even "
+                              "though this benchmark never sends prompts anywhere near that long.")
     parser.add_argument("--enforce-eager", action="store_true", default=True)
     return parser.parse_args()
 
@@ -169,6 +182,8 @@ def main():
         llm_kwargs["quantization"] = args.quantization
         if args.quantization == "bitsandbytes":
             llm_kwargs["load_format"] = "bitsandbytes"
+    if args.max_model_len is not None:
+        llm_kwargs["max_model_len"] = args.max_model_len
     llm = vllm.LLM(**llm_kwargs)
 
     block_manager = llm.llm_engine.scheduler[0].block_manager
