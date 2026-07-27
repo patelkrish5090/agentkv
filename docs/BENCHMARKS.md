@@ -65,8 +65,53 @@ already hitting at `n_users=64`, not that the advantage "disappears" at scale.
 **Not yet measured:** the actual maximum concurrent users each backend can
 sustain before failing outright (this sweep stopped at 64, chosen in
 advance, not because either backend broke); throughput (tokens/sec) under
-this same concurrent load; results on a model other than `facebook/opt-125m`;
-nested/multi-round forking (Tree-of-Thought depth > 1).
+this same concurrent load; nested/multi-round forking (Tree-of-Thought
+depth > 1); stock vLLM with its own native `--enable-prefix-caching` turned
+on instead of left at its default off (see the follow-up result below for
+why this matters).
+
+## Confirmed on the real target-scale model: DeepSeek-R1-Distill-Llama-8B (2026-07-27)
+
+The result above used `facebook/opt-125m` to keep the first real-engine
+attempt small and debuggable. This repeats the identical capacity-sweep
+methodology on the actual 8B model used elsewhere in this project (section 6
+of the notebook) — confirming the mechanism generalizes past a toy model.
+
+**Setup:** same as above, except model = `deepseek-ai/DeepSeek-R1-Distill-Llama-8B`
+loaded via vLLM's own in-flight bitsandbytes 4-bit quantization (~5.34 GB
+weights), `gpu_memory_utilization=0.7`, `max_model_len=4096` (capped down
+from the checkpoint's inherited 128K default — this benchmark's prompts
+never approach that length, and vLLM refuses to start otherwise since it
+insists the reserved KV cache be able to hold at least one full-length
+sequence). Total pool: **1239 GPU KV blocks, fixed for both backends.**
+
+**Measured peak KV blocks used (of 1239 total)**
+
+| n_users | total sequences | AgentKV | Stock | Blocks saved | % saved |
+|---|---|---|---|---|---|
+| 2  | 8  | 56 (4.5%)   | 56 (4.5%)   | 0   | 0% |
+| 4  | 16 | 103 (8.3%)  | 116 (9.4%)  | 13  | 11.2% |
+| 8  | 32 | 163 (13.2%) | 228 (18.4%) | 65  | 28.5% |
+| 16 | 64 | 287 (23.2%) | 456 (36.8%) | 169 | **37.1%** |
+
+Same shape as the opt-125m result: negligible difference at the lowest
+concurrency (`n_users=2` — both backends handle a single request's own
+`n=4` parallel-sampling fork equally well, since that's built into vLLM's
+own stock block manager too, not something exclusive to AgentKV), growing
+to 37.1% fewer blocks at `n_users=16`. The real differentiator is
+cross-request sharing between *different* users' prompts (which share the
+common context but diverge at the question) — that's the part stock isn't
+doing here.
+
+**Important caveat, not hidden:** both runs show `enable_prefix_caching=False`
+in vLLM's own logged config — stock vLLM ships with its own optional native
+prefix-caching feature *off* by default, so this comparison is "AgentKV vs.
+vLLM's out-of-the-box configuration," not "AgentKV vs. vLLM's own caching
+turned on." AgentKV's cross-request sharing is unconditional (it doesn't
+read or respect that flag), so a stricter follow-up would re-run stock with
+`--enable-prefix-caching` on to see whether AgentKV still wins against
+vLLM's own native answer to the same problem. That comparison hasn't been
+run yet.
 
 ## AgentKVCache vs. naive copy-per-agent, real model, real GPU (2026-07-26)
 
