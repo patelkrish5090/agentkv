@@ -190,7 +190,18 @@ pytest tests/test_stress.py -v --timeout=300
 
 ## Performance Claims
 
-Real, reproducible results against a real naive baseline, on a real DeepSeek-R1-Distill-Llama-8B
+**Real vLLM engine, real preemption event avoided.** `AgentKVBlockManager`
+patched into vLLM v0.5.4's actual `LLMEngine`/`Scheduler`, compared against
+unmodified stock vLLM, on identical concurrent traffic (`facebook/opt-125m`,
+T4 GPU, 1317 fixed GPU KV blocks for both backends): serving the same swept
+concurrency (4 → 64 users, 4 completions each), AgentKV used **22–40% fewer
+KV blocks** than stock at every point measured. More importantly: stock's
+own scheduler logged a real preemption warning ("not enough KV cache space
+... can affect the end-to-end performance") at a concurrency level where
+AgentKV was still at 46.8% utilization with no preemption anywhere in its
+log. See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the full sweep table.
+
+**AgentKVCache vs. a real naive baseline**, on a real DeepSeek-R1-Distill-Llama-8B
 (4-bit) model on a T4 GPU, 8 agents forked from an 879-token shared prompt
 (`torch.cuda.memory_allocated()`, measured not computed):
 
@@ -203,9 +214,9 @@ See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the full setup, the
 stage-by-stage numbers, and an important caveat about reading AgentKV's raw
 `memory_allocated()` totals in isolation (a fixed pool pre-allocation makes
 them look larger than naive's at a glance — the delta numbers above are the
-honest comparison). No throughput or memory-ceiling claims are made beyond
-what's in that file — anything not backed by a committed, reproduced
-benchmark script isn't claimed here.
+honest comparison). No throughput claims beyond what's in that file —
+anything not backed by a committed, reproduced benchmark script isn't
+claimed here.
 
 ---
 
