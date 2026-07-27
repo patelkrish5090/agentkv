@@ -24,14 +24,19 @@ and "one user's request explored via N branches" (e.g. best-of-N, ToT).
 Version note
 ------------
 integrations/vllm/block_manager.py was written against the exact vLLM
-version vendored for reference in vllm-src/ — v0.4.3 (2024-05-31). Install
-that exact version for the first real run:
-    pip install vllm==0.4.3
-vLLM's internals move fast; a newer vLLM release may have removed or
-changed `BlockSpaceManager` / `get_block_space_manager_class` entirely
-(vLLM's block-manager architecture has been reworked more than once since
-mid-2024). If `--backend agentkv` fails to even patch on a newer vLLM,
-that's the first thing to check — not necessarily a bug in AgentKV itself.
+version vendored for reference in vllm-src/ — v0.4.3 (2024-05-31). That
+exact release is no longer installable (its pinned `vllm-flash-attn==
+2.5.8.post2` dependency has since been removed from PyPI - only 2.6.x
+remains). v0.5.4 is the fallback: same block-manager era, likely resolvable
+dependency pins:
+    pip install vllm==0.5.4
+If even that fails to resolve, try the next few 0.5.x/0.6.x releases in
+order - vLLM's internals move fast, and a *much* newer release may have
+removed or changed `BlockSpaceManager` / `get_block_space_manager_class`
+entirely (vLLM's block-manager architecture has been reworked more than
+once, including a full V1 engine rewrite). If `--backend agentkv` fails to
+even patch on whatever version you land on, that's the first thing to
+check - not necessarily a bug in AgentKV itself.
 
 Usage
 -----
