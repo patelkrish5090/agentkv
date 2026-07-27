@@ -544,12 +544,22 @@ class DualRadixTree:
             if edge_match == 0:
                 break
 
+            if edge_match < len(edge):
+                # Partial edge match. v1 has no lazy split on the read path
+                # (splitting mutates the tree, which a pure lookup shouldn't
+                # do) — crediting a partial edge here would report a
+                # node_id whose blocks span MORE tokens than `matched`,
+                # letting a caller believe it shares blocks that actually
+                # belong to a different, divergent request. Stop before
+                # descending; _insert_shared_locked performs the real split
+                # on the write path (commit_prefix), so a subsequent commit
+                # against this same divergence point will still end up
+                # sharing correctly - this lookup just doesn't claim credit
+                # for tokens that were never split off into their own node.
+                break
+
             matched += edge_match
             current_id = child_id
-
-            if edge_match < len(edge):
-                # Partial edge match — stop here
-                break
 
         # Round down to block boundary
         bs = self._cfg.block_size
@@ -562,40 +572,117 @@ class DualRadixTree:
     def _insert_shared_locked(
         self, parent_id: int, tokens: List[int], blocks: List[BlockHandle]
     ) -> int:
-        """Insert tokens+blocks as a new child of parent in the shared tree.
+        """Insert tokens+blocks under parent in the shared tree, splitting an
+        existing child's edge if `tokens` only partially overlaps it.
 
-        Returns the new node_id.  Must be called with self._lock held.
+        Returns the node_id whose blocks correspond exactly to `tokens`
+        (either newly created, an existing exact match, or a new
+        intermediate node from a split). Must be called with self._lock
+        held. `len(tokens)` is always a multiple of block_size (enforced by
+        commit_prefix's caller-side validation), so every split point this
+        method computes lands on a block boundary too.
         """
-        parent = self._shared_nodes[parent_id]
-        first_token = tokens[0] if tokens else None
-
-        if first_token is None:
+        if not tokens:
             return parent_id
 
-        # Check if a child with this first token already exists (split needed)
-        if first_token in parent.children:
-            # Existing child — would need edge splitting for a full implementation.
-            # For v1: overwrite only if the tokens exactly match (no split).
-            # TODO: implement edge splitting for full radix tree correctness.
-            child_id = parent.children[first_token]
-            child = self._shared_nodes[child_id]
-            if child.edge_tokens == tokens:
-                # Update blocks in place (if they changed)
-                child.blocks = list(blocks)
-                return child_id
-            # Fall through: create a new sibling (simplified v1 behavior)
+        parent = self._shared_nodes[parent_id]
+        first_token = tokens[0]
+
+        if first_token not in parent.children:
+            new_id = self._next_node_id
+            self._next_node_id += 1
+            self._shared_nodes[new_id] = SharedNode(
+                node_id=new_id, parent_id=parent_id,
+                edge_tokens=list(tokens), blocks=list(blocks), ref_count=0,
+            )
+            parent.children[first_token] = new_id
+            return new_id
+
+        child_id = parent.children[first_token]
+        child = self._shared_nodes[child_id]
+        edge = child.edge_tokens
+
+        common = 0
+        max_common = min(len(edge), len(tokens))
+        while common < max_common and edge[common] == tokens[common]:
+            common += 1
+
+        if common == len(edge) and common == len(tokens):
+            # Exact match (e.g. idempotent re-commit of the same content).
+            child.blocks = list(blocks)
+            return child_id
+
+        bs = self._cfg.block_size
+
+        if common == len(edge):
+            # The existing edge is a strict prefix of `tokens` — nothing to
+            # split, just descend and insert the remainder under child.
+            return self._insert_shared_locked(
+                child_id, tokens[common:], blocks[common // bs:]
+            )
+
+        # Partial overlap: split child's edge at the longest block-aligned
+        # common prefix. If the two edges diverge inside the very first
+        # block (common < bs), there's no valid block boundary to split on
+        # at all — block-level granularity means we simply can't represent
+        # that little sharing, so fall through to inserting an unrelated
+        # sibling (same limitation the old v1 code had for every case, now
+        # narrowed to just this one).
+        split = (common // bs) * bs
+        if split == 0:
+            new_id = self._next_node_id
+            self._next_node_id += 1
+            self._shared_nodes[new_id] = SharedNode(
+                node_id=new_id, parent_id=parent_id,
+                edge_tokens=list(tokens), blocks=list(blocks), ref_count=0,
+            )
+            parent.children[first_token] = new_id
+            return new_id
+
+        split_blocks = split // bs
+
+        # New intermediate node takes over the first `split` tokens/blocks
+        # of the existing child's edge. Its ref_count starts as a copy of
+        # child's current ref_count (every handle already referencing child
+        # necessarily referenced this shorter shared prefix too); the
+        # caller's own _inc_shared_ref_locked() walk (after this method
+        # returns) adds this commit's own +1 on top for any node on the
+        # path back to the caller's new/updated leaf.
+        mid_id = self._next_node_id
+        self._next_node_id += 1
+        mid_node = SharedNode(
+            node_id=mid_id, parent_id=parent_id,
+            edge_tokens=list(edge[:split]), blocks=list(child.blocks[:split_blocks]),
+            ref_count=child.ref_count,
+        )
+        self._shared_nodes[mid_id] = mid_node
+
+        # Shrink the existing child to its remaining suffix, re-parented
+        # under the new intermediate node. Its own ref_count is untouched -
+        # it still represents exactly the same set of referrers as before,
+        # just measured from a shorter edge.
+        child.parent_id = mid_id
+        child.edge_tokens = list(edge[split:])
+        child.blocks = list(child.blocks[split_blocks:])
+        mid_node.children[child.edge_tokens[0]] = child_id
+
+        # Re-point parent -> mid, replacing the old direct parent -> child link.
+        parent.children[first_token] = mid_id
+
+        if split == len(tokens):
+            # The caller's own tokens end exactly at the split point - the
+            # intermediate node IS their node, nothing left to insert.
+            return mid_id
 
         new_id = self._next_node_id
         self._next_node_id += 1
         new_node = SharedNode(
-            node_id=new_id,
-            parent_id=parent_id,
-            edge_tokens=list(tokens),
-            blocks=list(blocks),
+            node_id=new_id, parent_id=mid_id,
+            edge_tokens=list(tokens[split:]), blocks=list(blocks[split_blocks:]),
             ref_count=0,
         )
         self._shared_nodes[new_id] = new_node
-        parent.children[tokens[0]] = new_id
+        mid_node.children[tokens[split]] = new_id
         return new_id
 
     def _inc_shared_ref_locked(self, node_id: int) -> None:

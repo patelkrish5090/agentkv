@@ -288,6 +288,58 @@ class TestCommitPrefix:
         assert h2.shared_match_len == 4
 
 
+    def test_diverging_commit_after_partial_prefix_does_not_raise(self, tree, small_cfg):
+        """Regression test for a real bug found via vLLM's real scheduler
+        (not caught by any earlier test): two requests share a prefix that
+        ends in the middle of an already-committed node's edge, then
+        diverge. The v1 tree had no edge-splitting, so a second commit
+        against that divergence point either mismatched shared_match_len
+        against the actual block count (crashing commit_prefix with
+        "requested N blocks but agent only has M residual blocks") or
+        silently orphaned the first branch. This mirrors exactly what
+        integrations/vllm/block_manager.py's allocate() does: create_root,
+        allocate blocks for the whole prompt, then commit the floor-aligned
+        length.
+        """
+        bs = small_cfg.block_size  # 4
+        prefix = list(range(100, 100 + 2 * bs))  # 2 blocks, shared
+        tail_a = list(range(200, 200 + bs))       # 1 block, diverges
+        tail_b = list(range(300, 300 + bs))       # 1 block, diverges differently
+
+        def simulate_request(tokens):
+            handle = tree.create_root(tokens)
+            required_blocks = (len(tokens) + bs - 1) // bs
+            while len(tree.get_block_ids(handle)) < required_blocks:
+                tree.allocate_block(handle)
+            safe_share_len = (len(tokens) // bs) * bs
+            residual_share_len = safe_share_len - handle.shared_match_len
+            if residual_share_len > 0:
+                tree.commit_prefix(handle, residual_share_len)
+            return handle
+
+        handle_a = simulate_request(prefix + tail_a)
+        handle_b = simulate_request(prefix + tail_b)  # must not raise
+
+        # Both requests end up with their full prompt correctly shared/owned.
+        assert handle_a.shared_match_len == len(prefix + tail_a)
+        assert handle_b.shared_match_len == len(prefix + tail_b)
+        assert len(tree.get_block_ids(handle_a)) == 3
+        assert len(tree.get_block_ids(handle_b)) == 3
+
+        # The prefix portion is now split off as its own shared node, so a
+        # THIRD request reusing just the prefix gets full credit immediately
+        # (not just the second commit fixing itself up).
+        tail_c = list(range(400, 400 + bs))
+        handle_c = tree.create_root(prefix + tail_c)
+        assert handle_c.shared_match_len == len(prefix)
+
+        # And the actual physical blocks for the shared prefix are identical
+        # across all three - real sharing, not merely consistent bookkeeping.
+        blocks_a = tree.get_block_ids(handle_a)
+        blocks_b = tree.get_block_ids(handle_b)
+        assert blocks_a[: len(prefix) // bs] == blocks_b[: len(prefix) // bs]
+
+
 # ── append_tokens ─────────────────────────────────────────────────────────────
 
 class TestAppendTokens:
