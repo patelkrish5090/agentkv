@@ -159,6 +159,14 @@ def main():
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=args.enforce_eager,
         trust_remote_code=True,
+        # AgentKVBlockManager.get_block_space_manager_class() only intercepts
+        # version == "v2" - vLLM 0.5.4 defaults use_v2_block_manager to False,
+        # which would silently run BOTH backends on vLLM's real v1 block
+        # manager (no crash, no visible sign anything was wrong - just a
+        # meaningless comparison). Force v2 for both --backend values so
+        # "stock" is a fair baseline against the same code path AgentKV
+        # replaces, not a different manager entirely.
+        use_v2_block_manager=True,
     )
     if args.quantization:
         llm_kwargs["quantization"] = args.quantization
