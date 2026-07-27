@@ -125,7 +125,10 @@ def parse_args():
     parser.add_argument("--max-tokens", type=int, default=40)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.5)
     parser.add_argument("--quantization", type=str, default=None,
-                         help="e.g. 'awq', 'gptq' - only if --model is pre-quantized for one of these")
+                         help="e.g. 'awq', 'gptq' (model must already be pre-quantized for those), "
+                              "or 'bitsandbytes' for real in-flight 4-bit NF4 quantization of a plain "
+                              "fp16/bf16 checkpoint (vLLM v0.5.4 has this built in - confirmed present "
+                              "in vllm/model_executor/layers/quantization/bitsandbytes.py at that tag)")
     parser.add_argument("--enforce-eager", action="store_true", default=True,
                          help="Skip CUDA graph capture - safer for a first real run, easier to debug on failure")
     return parser.parse_args()
@@ -159,6 +162,11 @@ def main():
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=args.enforce_eager,
         trust_remote_code=True,
+        # T4 is Turing - no native bf16 tensor cores. Pin float16 explicitly
+        # rather than trust "auto" dtype detection, which would pick
+        # whatever the checkpoint's config.json declares (often bfloat16
+        # for Llama-family models) and run badly or inconsistently on T4.
+        dtype="float16",
         # AgentKVBlockManager.get_block_space_manager_class() only intercepts
         # version == "v2" - vLLM 0.5.4 defaults use_v2_block_manager to False,
         # which would silently run BOTH backends on vLLM's real v1 block
@@ -170,6 +178,11 @@ def main():
     )
     if args.quantization:
         llm_kwargs["quantization"] = args.quantization
+        if args.quantization == "bitsandbytes":
+            # bnb requires BOTH quantization and load_format set to trigger
+            # vLLM's in-flight NF4 quantization path - quantization alone
+            # silently does nothing for a plain (non-pre-quantized) checkpoint.
+            llm_kwargs["load_format"] = "bitsandbytes"
     llm = vllm.LLM(**llm_kwargs)
     load_s = time.perf_counter() - t0
     print(f"   Loaded in {load_s:.1f}s")

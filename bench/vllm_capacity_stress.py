@@ -122,7 +122,12 @@ def parse_args():
     parser.add_argument("--n-agents-per-user", type=int, default=4)
     parser.add_argument("--max-tokens", type=int, default=60)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.1,
-                         help="Deliberately small - makes capacity pressure reachable")
+                         help="Deliberately small - makes capacity pressure reachable. "
+                              "Raise this (e.g. 0.7) for a large model like an 8B checkpoint, "
+                              "where weights alone need real headroom before any KV blocks fit.")
+    parser.add_argument("--quantization", type=str, default=None,
+                         help="'bitsandbytes' for real in-flight 4-bit NF4 quantization of a plain "
+                              "fp16/bf16 checkpoint (confirmed present in vLLM v0.5.4)")
     parser.add_argument("--enforce-eager", action="store_true", default=True)
     return parser.parse_args()
 
@@ -149,13 +154,22 @@ def main():
         print("\n[stock] Running with vLLM's own unmodified BlockSpaceManagerV2.")
 
     print(f"\nLoading {args.model}...")
-    llm = vllm.LLM(
+    llm_kwargs = dict(
         model=args.model,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=args.enforce_eager,
         trust_remote_code=True,
+        # T4 is Turing - no native bf16 tensor cores. Pin float16 rather
+        # than trust "auto" dtype detection (often bfloat16 for Llama-
+        # family checkpoints' config.json).
+        dtype="float16",
         use_v2_block_manager=True,
     )
+    if args.quantization:
+        llm_kwargs["quantization"] = args.quantization
+        if args.quantization == "bitsandbytes":
+            llm_kwargs["load_format"] = "bitsandbytes"
+    llm = vllm.LLM(**llm_kwargs)
 
     block_manager = llm.llm_engine.scheduler[0].block_manager
     total_blocks = llm.llm_engine.cache_config.num_gpu_blocks
