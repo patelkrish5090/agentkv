@@ -115,6 +115,14 @@ def test_append_slots_triggers_cow_on_shared_block(manager: AgentKVBlockManager)
     parent.append_token_id(9001)
     cows_parent = manager.append_slots(parent, num_lookahead_slots=0)
     assert cows_parent, "expected a CoW copy when writing into a ref-counted residual block"
+    # vLLM's real Worker does torch.tensor(blocks_to_copy, ...) expecting
+    # plain int pairs, not BlockHandle objects (see block_manager.py's
+    # mock_copy_block) - this only surfaced against a real vLLM engine,
+    # never against these stubs, because nothing here checked element type.
+    for src, dst in cows_parent:
+        assert isinstance(src, int) and isinstance(dst, int), (
+            f"CoW pair must be plain ints, got {type(src)}, {type(dst)}"
+        )
 
     # Parent no longer shares physical storage with the child for that block.
     assert manager.pool._allocator.ref_count(shared_residual_block) == 1

@@ -51,9 +51,14 @@ class AgentKVBlockManager(BlockSpaceManager):
         self.pool._allocator.pending_cows = []
         original_copy_block = self.pool._allocator.copy_block
         
-        def mock_copy_block(src_idx: int, dst_idx: int):
-            # Record the cow
-            self.pool._allocator.pending_cows.append((src_idx, dst_idx))
+        def mock_copy_block(src, dst):
+            # SlabAllocator.copy_block() is called with BlockHandle objects
+            # (see DualRadixTree.ensure_mutable_block), not raw ints - vLLM's
+            # real Worker expects blocks_to_copy as a flat list of plain int
+            # pairs (it builds a torch.tensor straight from this list), so
+            # unwrap to .block_id here rather than passing the handles
+            # through as-is.
+            self.pool._allocator.pending_cows.append((src.block_id, dst.block_id))
             # No physical copy since device="meta"
         
         self.pool._allocator.copy_block = mock_copy_block
