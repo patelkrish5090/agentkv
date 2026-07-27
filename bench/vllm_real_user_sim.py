@@ -54,9 +54,20 @@ python bench/vllm_real_user_sim.py --model <model> --backend stock \\
 """
 
 import argparse
+import os
+import sys
 import time
 
 import torch
+
+# `integrations` is only importable from the project root - pyproject.toml's
+# editable install packages `agentkv*` only, not `integrations`, and
+# `python bench/this_script.py` puts bench/'s own directory on sys.path[0],
+# not the project root one level up. Add it explicitly rather than relying
+# on the caller's cwd or a PYTHONPATH env var.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 SHARED_CONTEXT = (
     "You are a customer support AI assistant for a cloud infrastructure "

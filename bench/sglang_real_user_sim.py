@@ -35,11 +35,17 @@ python bench/sglang_real_user_sim.py --model facebook/opt-125m \\
 """
 
 import argparse
+import os
 import subprocess
 import sys
 import threading
 import time
 
+# `integrations` is only importable from the project root - see the same
+# note in bench/vllm_real_user_sim.py.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 SHARED_CONTEXT = (
     "You are a customer support AI assistant for a cloud infrastructure "
